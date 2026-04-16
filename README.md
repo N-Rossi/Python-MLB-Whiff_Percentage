@@ -108,7 +108,6 @@ python -m reports.first_pitch_offspeed.analyze nl_east al_west
 ## Project layout
 
 ```
-Python-MLB-Whiff_Percentage/
 ├── home.py                          # Streamlit entry point + navigation
 ├── fetch_starters.py                # Shared Statcast data pull
 ├── data/                            # Shared cached CSVs (one set per division)
