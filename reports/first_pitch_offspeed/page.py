@@ -98,7 +98,7 @@ if not selected_divs:
 st.sidebar.header("Filters (uncheck to ignore)")
 velo_threshold = _toggle_slider(
     "velo_thr", "Velo threshold (mph)", True,
-    90.0, 100.0, 94.9, 0.1,
+    90.0, 100.0, 95.0, 0.1,
     help="Pitchers with avg fastball >= this go in the 'high-velo' bucket. Disable to skip the high/low split.",
 )
 velo_floor = _toggle_slider(
@@ -134,19 +134,6 @@ min_pitches = _toggle_int(
     help="Per-pitcher gate for CSW% sample size. Drop pitchers with fewer first-pitch offspeed pitches than this.",
 )
 
-st.sidebar.header("Regression cutoffs")
-reg_velo_cut = st.sidebar.number_input(
-    "High-velo cutoff (mph)",
-    min_value=85.0, max_value=100.0, value=float(velo_threshold or 95.0), step=0.1,
-    help="Pitchers with avg FB at or above this are coded as 1 in the high_velo dummy.",
-)
-reg_vsep_cut = st.sidebar.number_input(
-    "Wide-vsep cutoff (in)",
-    min_value=0.0, max_value=30.0, value=16.0, step=0.5,
-    help="Pitchers with VSep at or above this are coded as 1 in the wide_vsep dummy. "
-         "Independent of the bucket-display vsep threshold above.",
-)
-
 st.sidebar.markdown("---")
 st.sidebar.caption(
     f"**Fastball** = {sorted(FASTBALL_TYPES)}  \n"
@@ -166,8 +153,6 @@ result = compute_buckets(
     min_offspeed=min_offspeed,
     min_swings=min_swings,
     min_pitches=min_pitches,
-    regression_velo_cut=reg_velo_cut,
-    regression_vsep_cut=reg_vsep_cut,
     divisions=selected_divs,
 )
 
@@ -242,13 +227,9 @@ def _stars(p):
     return ""
 
 
-def _render_regression(reg):
-    st.header("Regression: whiff% vs. velo + vsep")
-    st.caption(
-        f"OLS, per-pitcher first-pitch offspeed whiff% on `high_velo` (FB ≥ "
-        f"{reg['velo_cut']} mph), `wide_vsep` (VSep ≥ {reg['vsep_cut']}\"), "
-        f"and their interaction. Same eligible pitchers as the buckets above."
-    )
+def _render_regression(reg, title, caption, f_help):
+    st.header(title)
+    st.caption(caption)
 
     if reg.get("skipped_reason"):
         st.warning(reg["skipped_reason"])
@@ -258,8 +239,7 @@ def _render_regression(reg):
     c1.metric("N", reg["n"])
     c2.metric("R²", f"{reg['r_squared']:.3f}")
     c3.metric("Adj. R²", f"{reg['adj_r_squared']:.3f}")
-    c4.metric("F p-value", f"{reg['f_p_value']:.4f}",
-              help="Joint test that all slope coefficients are zero.")
+    c4.metric("F p-value", f"{reg['f_p_value']:.4f}", help=f_help)
 
     coef_df = pd.DataFrame([
         {
@@ -276,38 +256,32 @@ def _render_regression(reg):
     st.subheader("Coefficients")
     st.dataframe(coef_df, use_container_width=True, hide_index=True)
     st.caption("Significance: `***` p<0.001, `**` p<0.01, `*` p<0.05, `.` p<0.10. "
-               "β is in percentage points of whiff%.")
-
-    # 2x2 cell-mean grid — easier to read than the coefficients alone.
-    st.subheader("Cell means (whiff%)")
-    cells = {(c["high_velo"], c["wide_vsep"]): c for c in reg["cells"]}
-    grid_rows = []
-    for hv in (False, True):
-        row = {"velo": "High velo" if hv else "Low velo"}
-        for wv in (False, True):
-            cell = cells[(hv, wv)]
-            mean = cell["mean_whiff_rate"]
-            row[f"vsep {'≥' if wv else '<'} {reg['vsep_cut']}\""] = (
-                f"{mean:.1f}%  (N={cell['n']})" if mean is not None
-                else f"n/a  (N={cell['n']})"
-            )
-        grid_rows.append(row)
-    st.dataframe(pd.DataFrame(grid_rows), use_container_width=True, hide_index=True)
-
-    small_cells = [c for c in reg["cells"] if c["n"] < 5]
-    if small_cells:
-        labels = ", ".join(
-            f"{'high' if c['high_velo'] else 'low'} velo + "
-            f"{'wide' if c['wide_vsep'] else 'narrow'} vsep (N={c['n']})"
-            for c in small_cells
-        )
-        st.warning(
-            f"Sparse cells make some coefficients unstable: {labels}. "
-            f"Try lowering the high-velo cutoff or raising the wide-vsep cutoff."
-        )
+               "β for `vsep` = pp of whiff% per additional inch of vertical separation. "
+               "Each row shows its own standard error and p-value.")
 
 
-_render_regression(result["regression"])
+_render_regression(
+    result["regression"],
+    title="Regression 1: whiff% ~ vsep",
+    caption=(
+        "OLS, Y = per-pitcher first-pitch offspeed whiff%. "
+        "X of interest: `vsep` (continuous, inches). No controls. "
+        "Same eligible pitchers as the buckets above."
+    ),
+    f_help="Test that the vsep slope is zero.",
+)
+
+_velo_cut = result["regression_velo"].get("velo_cut", 95.0)
+_render_regression(
+    result["regression_velo"],
+    title=f"Regression 2: whiff% ~ vsep + high_velo (FB ≥ {_velo_cut} mph)",
+    caption=(
+        f"OLS, Y = whiff%. X: `vsep` (continuous, inches) + `high_velo` "
+        f"(1 if avg FB ≥ {_velo_cut} mph, else 0). Adds high-velo as a control "
+        f"to Regression 1 — compare the vsep coefficient across the two fits."
+    ),
+    f_help="Joint test that both slope coefficients (vsep, high_velo) are zero.",
+)
 
 
 # --- Pitcher-level visuals ---
@@ -492,4 +466,4 @@ if tab_labels:
             else:
                 st.dataframe(_roster_df(roster), use_container_width=True, hide_index=True)
 
-st.caption("Source: cached Statcast pulls in `data/{division}_starters_*_pitches.csv`. Starters with > 3 GS only.")
+st.caption("Source: cached Statcast pulls in `data/{division}_starters_*_pitches.parquet`. Starters with > 3 GS only.")

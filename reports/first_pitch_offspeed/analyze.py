@@ -15,7 +15,7 @@ import pandas as pd
 import statsmodels.api as sm
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
-PITCHES_GLOB = "*_starters_*_pitches.csv"
+PITCHES_GLOB = "*_starters_*_pitches.parquet"
 
 # Statcast pitch_type codes
 # Cutter (FC) is excluded from "fastball" for velocity-bucketing because it
@@ -38,7 +38,7 @@ SWING_DESCRIPTIONS = {
 CALLED_STRIKE_DESCRIPTION = "called_strike"
 
 
-_DIVISION_FROM_FILENAME = re.compile(r"^(.+?)_starters_\d+_pitches\.csv$")
+_DIVISION_FROM_FILENAME = re.compile(r"^(.+?)_starters_\d+_pitches\.parquet$")
 
 
 def available_divisions():
@@ -53,14 +53,14 @@ def available_divisions():
 
 def load_pitches(divisions=None):
     """
-    Load and concat every {division}_starters_*_pitches.csv in the data dir.
-    If `divisions` is given, restrict to those. Adds/repairs the `division`
-    column from the filename for older CSVs that predate that column.
+    Load and concat every {division}_starters_*_pitches.parquet in the data
+    dir. If `divisions` is given, restrict to those. Adds/repairs the
+    `division` column from the filename for older files that predate it.
     """
     paths = sorted(DATA_DIR.glob(PITCHES_GLOB))
     if not paths:
         raise FileNotFoundError(
-            f"No pitch CSVs found in {DATA_DIR}. "
+            f"No pitch parquet files found in {DATA_DIR}. "
             f"Run `python fetch_starters.py <division>` first."
         )
 
@@ -70,14 +70,14 @@ def load_pitches(divisions=None):
         div = m.group(1) if m else path.stem
         if divisions and div not in divisions:
             continue
-        df = pd.read_csv(path)
+        df = pd.read_parquet(path)
         if "division" not in df.columns:
             df["division"] = div
         frames.append(df)
 
     if not frames:
         raise FileNotFoundError(
-            f"No pitch CSVs matched divisions={divisions}. "
+            f"No pitch parquet files matched divisions={divisions}. "
             f"Available: {available_divisions()}"
         )
     return pd.concat(frames, ignore_index=True)
@@ -99,17 +99,12 @@ def _pitch_stats(d):
     }
 
 
-def _run_regression(per_pitcher_df, velo_cut, vsep_cut):
+def _run_regression(per_pitcher_df):
     """
-    OLS of per-pitcher first-pitch offspeed whiff% on:
-        intercept, high_velo, wide_vsep, high_velo * wide_vsep
-
-    Pitchers without a defined whiff_rate or vsep are dropped (no swings,
-    or insufficient FF / offspeed pitches to compute vsep). Returns a dict
-    with the coefficient table, fit statistics, the 2x2 cell means used
-    for plain-English interpretation, and the eligible N.
+    Simple bivariate OLS: Y = per-pitcher first-pitch offspeed whiff%,
+    X = vsep (continuous, inches).
     """
-    df = per_pitcher_df.dropna(subset=["whiff_rate", "vsep", "velo"]).copy()
+    df = per_pitcher_df.dropna(subset=["whiff_rate", "vsep"]).copy()
     n = len(df)
     if n < 4:
         return {
@@ -119,24 +114,16 @@ def _run_regression(per_pitcher_df, velo_cut, vsep_cut):
                 f"the regression (have {n}). Loosen sample-size gates or add "
                 f"more divisions."
             ),
-            "velo_cut": velo_cut,
-            "vsep_cut": vsep_cut,
         }
 
-    df["high_velo"] = (df["velo"] >= velo_cut).astype(int)
-    df["wide_vsep"] = (df["vsep"] >= vsep_cut).astype(int)
-    df["interaction"] = df["high_velo"] * df["wide_vsep"]
-
-    X = sm.add_constant(df[["high_velo", "wide_vsep", "interaction"]])
+    X = sm.add_constant(df[["vsep"]])
     y = df["whiff_rate"]
     model = sm.OLS(y, X).fit()
 
     ci = model.conf_int()
     pretty = {
-        "const": "Intercept (low velo, narrow vsep)",
-        "high_velo": f"High velo (FB >= {velo_cut} mph)",
-        "wide_vsep": f"Wide vsep (>= {vsep_cut}\")",
-        "interaction": "High velo × Wide vsep",
+        "const": "Intercept (vsep = 0)",
+        "vsep": "VSep (in) — variable of interest",
     }
     coefficients = [
         {
@@ -149,36 +136,76 @@ def _run_regression(per_pitcher_df, velo_cut, vsep_cut):
             "ci_lower": float(ci.loc[name, 0]),
             "ci_upper": float(ci.loc[name, 1]),
         }
-        for name in ["const", "high_velo", "wide_vsep", "interaction"]
+        for name in ["const", "vsep"]
     ]
-
-    # 2x2 cell means: rows = velo, cols = vsep
-    cells = []
-    for hv in (0, 1):
-        for wv in (0, 1):
-            cell = df[(df["high_velo"] == hv) & (df["wide_vsep"] == wv)]
-            cells.append({
-                "high_velo": bool(hv),
-                "wide_vsep": bool(wv),
-                "n": len(cell),
-                "mean_whiff_rate": float(cell["whiff_rate"].mean()) if len(cell) else None,
-            })
 
     return {
         "n": n,
-        "velo_cut": velo_cut,
-        "vsep_cut": vsep_cut,
         "r_squared": float(model.rsquared),
         "adj_r_squared": float(model.rsquared_adj),
         "f_statistic": float(model.fvalue) if model.fvalue is not None else None,
         "f_p_value": float(model.f_pvalue) if model.f_pvalue is not None else None,
         "coefficients": coefficients,
-        "cells": cells,
+    }
+
+
+def _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0):
+    """
+    OLS: Y = per-pitcher first-pitch offspeed whiff%,
+    X = vsep (continuous, in) + high_velo (1 if avg FB >= velo_cut mph).
+    Adds high_velo as a control on top of the bivariate vsep model.
+    """
+    df = per_pitcher_df.dropna(subset=["whiff_rate", "vsep", "velo"]).copy()
+    n = len(df)
+    if n < 4:
+        return {
+            "n": n,
+            "skipped_reason": (
+                f"Need >= 4 pitchers with a defined whiff%, VSep, and velo "
+                f"to fit the regression (have {n})."
+            ),
+            "velo_cut": velo_cut,
+        }
+
+    df["high_velo"] = (df["velo"] >= velo_cut).astype(int)
+
+    X = sm.add_constant(df[["vsep", "high_velo"]])
+    y = df["whiff_rate"]
+    model = sm.OLS(y, X).fit()
+
+    ci = model.conf_int()
+    pretty = {
+        "const": "Intercept (low velo, vsep = 0)",
+        "vsep": "VSep (in) — variable of interest",
+        "high_velo": f"High velo (FB >= {velo_cut} mph)",
+    }
+    coefficients = [
+        {
+            "name": name,
+            "label": pretty[name],
+            "coef": float(model.params[name]),
+            "std_err": float(model.bse[name]),
+            "t": float(model.tvalues[name]),
+            "p_value": float(model.pvalues[name]),
+            "ci_lower": float(ci.loc[name, 0]),
+            "ci_upper": float(ci.loc[name, 1]),
+        }
+        for name in ["const", "vsep", "high_velo"]
+    ]
+
+    return {
+        "n": n,
+        "velo_cut": velo_cut,
+        "r_squared": float(model.rsquared),
+        "adj_r_squared": float(model.rsquared_adj),
+        "f_statistic": float(model.fvalue) if model.fvalue is not None else None,
+        "f_p_value": float(model.f_pvalue) if model.f_pvalue is not None else None,
+        "coefficients": coefficients,
     }
 
 
 def compute_buckets(
-    velo_threshold=94.9,   # None -> skip high/low velo split
+    velo_threshold=95.0,   # None -> skip high/low velo split
     velo_floor=90.9,       # None -> no velo floor (include everyone)
     vsep_threshold=18.0,   # None -> skip vertical-separation sub-split
     min_fastballs=50,      # 0/None -> no minimum
@@ -186,8 +213,6 @@ def compute_buckets(
     min_offspeed=30,
     min_swings=0,          # 0/None -> no minimum first-pitch offspeed swings
     min_pitches=0,         # 0/None -> no minimum first-pitch offspeed pitches (CSW% sample gate)
-    regression_velo_cut=None,  # None -> falls back to velo_threshold (or 95.0 if that is also off)
-    regression_vsep_cut=16.0,  # IVB-separation cutoff used by the regression dummy
     divisions=None,
 ):
     """
@@ -370,12 +395,8 @@ def compute_buckets(
         })
     per_pitcher_df = pd.DataFrame(reg_rows)
 
-    eff_velo_cut = (
-        regression_velo_cut
-        if regression_velo_cut is not None
-        else (velo_threshold if velo_threshold is not None else 95.0)
-    )
-    regression = _run_regression(per_pitcher_df, eff_velo_cut, regression_vsep_cut)
+    regression = _run_regression(per_pitcher_df)
+    regression_velo = _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0)
 
     return {
         "params": {
@@ -387,18 +408,17 @@ def compute_buckets(
             "min_offspeed": min_offspeed,
             "min_swings": min_swings,
             "min_pitches": min_pitches,
-            "regression_velo_cut": eff_velo_cut,
-            "regression_vsep_cut": regression_vsep_cut,
             "divisions": divisions_loaded,
         },
         "comparisons": comparisons,
         "excluded_below_floor": excluded,
         "regression": regression,
+        "regression_velo": regression_velo,
     }
 
 
 def whiff_rate_by_velo_bucket(
-    velo_threshold=94.9,
+    velo_threshold=95.0,
     velo_floor=90.9,
     vsep_threshold=18.0,
     min_fastballs=50,

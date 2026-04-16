@@ -12,8 +12,8 @@ Usage:
     python fetch_starters.py all          # iterate every division
 
 Output (one set of files per division, written to ./data/):
-    data/{division}_starters_{SEASON}_roster.csv   -- one row per pitcher
-    data/{division}_starters_{SEASON}_pitches.csv  -- one row per pitch
+    data/{division}_starters_{SEASON}_roster.parquet   -- one row per pitcher
+    data/{division}_starters_{SEASON}_pitches.parquet  -- one row per pitch
 """
 
 from pathlib import Path
@@ -145,8 +145,8 @@ def fetch_division(division):
         sys.exit(1)
 
     teams = DIVISIONS[division]
-    roster_csv = OUT_DIR / f"{division}_starters_{SEASON}_roster.csv"
-    pitches_csv = OUT_DIR / f"{division}_starters_{SEASON}_pitches.csv"
+    roster_path = OUT_DIR / f"{division}_starters_{SEASON}_roster.parquet"
+    pitches_path = OUT_DIR / f"{division}_starters_{SEASON}_pitches.parquet"
 
     print(f"=== Fetching {division.upper()} ({sorted(teams)}) ===")
     df = pull_division_statcast(teams)
@@ -160,17 +160,17 @@ def fetch_division(division):
 
     # Tag rows with the division so the analyze script can filter by it
     roster["division"] = division
-    roster.to_csv(roster_csv, index=False)
-    print(f"\nWrote roster -> {roster_csv}")
+    roster.to_parquet(roster_path, index=False)
+    print(f"\nWrote roster -> {roster_path}")
 
     pitches = div_pitches[div_pitches["pitcher"].isin(roster["mlbam_id"])].copy()
     name_map = roster.set_index("mlbam_id")["Name"].to_dict()
     pitches["pitcher_name"] = pitches["pitcher"].map(name_map)
     pitches["division"] = division
 
-    pitches.to_csv(pitches_csv, index=False)
+    pitches.to_parquet(pitches_path, index=False)
     print(f"\nWrote {len(pitches):,} pitches across {pitches['pitcher'].nunique()} pitchers")
-    print(f"  -> {pitches_csv}")
+    print(f"  -> {pitches_path}")
 
 
 def main():
