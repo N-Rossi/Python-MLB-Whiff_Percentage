@@ -7,13 +7,13 @@ are currently broken/blocked, so we derive the starter list directly
 from Statcast instead of relying on a third-party stat source.
 
 Usage:
-    python multi/fetch_starters.py nl_east
-    python multi/fetch_starters.py al_west
-    python multi/fetch_starters.py all          # iterate every division
+    python fetch_starters.py nl_east
+    python fetch_starters.py al_west
+    python fetch_starters.py all          # iterate every division
 
-Output (one set of files per division):
-    multi/{division}_starters_{SEASON}_roster.csv   -- one row per pitcher
-    multi/{division}_starters_{SEASON}_pitches.csv  -- one row per pitch
+Output (one set of files per division, written to ./data/):
+    data/{division}_starters_{SEASON}_roster.csv   -- one row per pitcher
+    data/{division}_starters_{SEASON}_pitches.csv  -- one row per pitch
 """
 
 from pathlib import Path
@@ -43,7 +43,7 @@ MIN_GAMES_STARTED = 3  # "more than 3"
 SEASON_START = f"{SEASON}-03-01"
 SEASON_END = f"{SEASON}-11-30"
 
-OUT_DIR = Path(__file__).parent
+OUT_DIR = Path(__file__).parent / "data"
 
 
 def _date_chunks(start, end, days=14):

@@ -1,4 +1,5 @@
 altair
 pandas
 pybaseball
+statsmodels
 streamlit
