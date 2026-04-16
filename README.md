@@ -56,6 +56,25 @@ Streamlit prints a local URL (typically http://localhost:8501) — open it in a
 browser. Use the sidebar to pick divisions and toggle filters (velo threshold,
 IVB, minimum pitches, etc.).
 
+### `streamlit: command not found` / `'streamlit' is not recognized`
+
+If the `streamlit` command isn't on your PATH, run it as a Python module
+instead — this works on any platform:
+
+```bash
+python -m streamlit run app.py
+```
+
+If that also fails with `No module named streamlit`, the dependencies aren't
+installed into the Python you're using. Check:
+
+1. The virtual environment is activated (your shell prompt should show
+   `(.venv)`). On Windows: `.venv\Scripts\activate`. On macOS/Linux:
+   `source .venv/bin/activate`.
+2. `pip install -r requirements.txt` was run **after** activating the venv.
+3. `pip` and `python` resolve to the same interpreter — verify with
+   `python -m pip list | grep streamlit` (or `findstr streamlit` on Windows).
+
 ## Command-line analysis
 
 `analyze_pitches.py` can also be imported directly for ad-hoc analysis:
