@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(python -c \"import pyarrow; print\\(pyarrow.__version__\\)\")",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import pandas as pd, glob; f=sorted\\(glob.glob\\('data/*_pitches.parquet'\\)\\)[0]; df=pd.read_parquet\\(f\\); print\\(f\\); print\\([c for c in df.columns if c in \\('zone','p_throws','stand','pitch_type','description','pitch_number'\\)]\\); print\\(df['zone'].head\\(10\\).tolist\\(\\)\\); print\\('p_throws:', df['p_throws'].value_counts\\(\\).to_dict\\(\\)\\); print\\('stand:', df['stand'].value_counts\\(\\).to_dict\\(\\)\\); print\\('pitch_type top:', df['pitch_type'].value_counts\\(\\).head\\(10\\).to_dict\\(\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('reports/first_pitch_offspeed/analyze.py'\\).read\\(\\)\\); ast.parse\\(open\\('reports/first_pitch_offspeed/page.py'\\).read\\(\\)\\); print\\('OK: both files parse'\\)\")",
+      "Bash(python -m reports.first_pitch_offspeed.analyze)"
     ]
   }
 }

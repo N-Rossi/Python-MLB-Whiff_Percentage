@@ -99,10 +99,21 @@ def _pitch_stats(d):
     }
 
 
+def _fit_weighted_or_ols(y, X, weights=None):
+    """WLS when valid positive weights are provided, else plain OLS."""
+    if weights is not None:
+        w = pd.Series(weights).fillna(0).to_numpy()
+        if (w > 0).any():
+            return sm.WLS(y, X, weights=w).fit(), "WLS (weighted by swings)"
+    return sm.OLS(y, X).fit(), "OLS (unweighted)"
+
+
 def _run_regression(per_pitcher_df):
     """
-    Simple bivariate OLS: Y = per-pitcher first-pitch offspeed whiff%,
-    X = vsep (continuous, inches).
+    Bivariate WLS: Y = per-pitcher first-pitch offspeed whiff%,
+    X = vsep (in). Each pitcher weighted by their first-pitch OS swing
+    count, so high-sample pitchers get more pull and low-sample pitchers
+    don't drag the slope around with noisy whiff%.
     """
     df = per_pitcher_df.dropna(subset=["whiff_rate", "vsep"]).copy()
     n = len(df)
@@ -118,7 +129,8 @@ def _run_regression(per_pitcher_df):
 
     X = sm.add_constant(df[["vsep"]])
     y = df["whiff_rate"]
-    model = sm.OLS(y, X).fit()
+    weights = df["swings"] if "swings" in df.columns else None
+    model, fit_method = _fit_weighted_or_ols(y, X, weights=weights)
 
     ci = model.conf_int()
     pretty = {
@@ -141,6 +153,8 @@ def _run_regression(per_pitcher_df):
 
     return {
         "n": n,
+        "fit_method": fit_method,
+        "total_weight": float(weights.sum()) if weights is not None else None,
         "r_squared": float(model.rsquared),
         "adj_r_squared": float(model.rsquared_adj),
         "f_statistic": float(model.fvalue) if model.fvalue is not None else None,
@@ -151,7 +165,7 @@ def _run_regression(per_pitcher_df):
 
 def _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0):
     """
-    OLS: Y = per-pitcher first-pitch offspeed whiff%,
+    WLS: Y = per-pitcher first-pitch offspeed whiff%,
     X = vsep (continuous, in) + high_velo (1 if avg FB >= velo_cut mph).
     Adds high_velo as a control on top of the bivariate vsep model.
     """
@@ -171,7 +185,8 @@ def _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0):
 
     X = sm.add_constant(df[["vsep", "high_velo"]])
     y = df["whiff_rate"]
-    model = sm.OLS(y, X).fit()
+    weights = df["swings"] if "swings" in df.columns else None
+    model, fit_method = _fit_weighted_or_ols(y, X, weights=weights)
 
     ci = model.conf_int()
     pretty = {
@@ -196,6 +211,8 @@ def _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0):
     return {
         "n": n,
         "velo_cut": velo_cut,
+        "fit_method": fit_method,
+        "total_weight": float(weights.sum()) if weights is not None else None,
         "r_squared": float(model.rsquared),
         "adj_r_squared": float(model.rsquared_adj),
         "f_statistic": float(model.fvalue) if model.fvalue is not None else None,
@@ -204,34 +221,111 @@ def _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0):
     }
 
 
-def compute_buckets(
-    velo_threshold=95.0,   # None -> skip high/low velo split
-    velo_floor=90.9,       # None -> no velo floor (include everyone)
-    vsep_threshold=18.0,   # None -> skip vertical-separation sub-split
-    min_fastballs=50,      # 0/None -> no minimum
+# Pitch-type families used to label each pitch row. Reference / "other"
+# = anything offspeed not in these three sets (sweeper ST, knuckle-curve KC,
+# splitter FS, slurve SV, etc.).
+PITCH_TYPE_FAMILIES = {
+    "slider":    {"SL"},
+    "changeup":  {"CH"},
+    "curveball": {"CU"},
+}
+
+
+def _pitch_family(code):
+    for fam, codes in PITCH_TYPE_FAMILIES.items():
+        if code in codes:
+            return fam
+    return "other"
+
+
+def _build_pitch_details(d, name_map, division_map, velo_dict, vsep_dict):
+    """
+    One row per first-pitch offspeed pitch (already filtered by the caller).
+    Assumes `d` already has `in_zone`, `same_hand`, and `pitch_family` cols.
+    Adds the pitcher's avg FB velo and VSep so each row carries the X-vars
+    from the regression alongside the pitch-level slicer columns.
+    """
+    if d.empty:
+        return []
+
+    d = d.copy()
+    d["swing"] = d["description"].isin(SWING_DESCRIPTIONS).astype(int)
+    d["whiff"] = d["description"].str.startswith("swinging_strike").astype(int)
+    d["called_strike"] = (d["description"] == CALLED_STRIKE_DESCRIPTION).astype(int)
+
+    sort_cols = [c for c in ("pitcher", "game_date", "at_bat_number") if c in d.columns]
+    if sort_cols:
+        d = d.sort_values(sort_cols)
+
+    rows = []
+    for r in d.itertuples(index=False):
+        rd = r._asdict()
+        pid = rd["pitcher"]
+        rows.append({
+            "pitcher_id": int(pid),
+            "pitcher": name_map.get(pid, str(pid)),
+            "division": division_map.get(pid),
+            "game_date": str(rd.get("game_date")) if rd.get("game_date") is not None else None,
+            "velo": float(velo_dict[pid]) if pid in velo_dict else None,
+            "vsep": float(vsep_dict[pid]) if pid in vsep_dict else None,
+            "pitch_type": rd.get("pitch_type"),
+            "pitch_family": rd.get("pitch_family"),
+            "p_throws": rd.get("p_throws"),
+            "stand": rd.get("stand"),
+            "in_zone": int(rd["in_zone"]) if pd.notna(rd["in_zone"]) else None,
+            "same_hand": int(rd["same_hand"]) if pd.notna(rd["same_hand"]) else None,
+            "description": rd.get("description"),
+            "swing": int(rd["swing"]),
+            "whiff": int(rd["whiff"]),
+            "called_strike": int(rd["called_strike"]),
+        })
+    return rows
+
+
+# Slicer option constants — UI choices map to these values.
+LOCATION_OPTIONS = (None, "in", "out")
+PLATOON_OPTIONS = (None, "same", "opp")
+P_THROWS_OPTIONS = (None, "L", "R")
+ALL_FAMILIES = ("slider", "changeup", "curveball", "other")
+
+
+def compute(
+    pitch_families=None,    # None -> all four families
+    location=None,          # None / "in" / "out"
+    platoon=None,           # None / "same" / "opp"
+    p_throws_filter=None,   # None / "L" / "R"
+    velo_floor=90.9,        # None -> no velo floor
+    min_fastballs=50,       # 0/None -> no minimum
     min_4seam=30,
     min_offspeed=30,
-    min_swings=0,          # 0/None -> no minimum first-pitch offspeed swings
-    min_pitches=0,         # 0/None -> no minimum first-pitch offspeed pitches (CSW% sample gate)
+    min_swings=0,           # filtered swing count gate
+    min_pitches=0,          # filtered pitch count gate
     divisions=None,
 ):
     """
-    Pure-data version: returns a structured dict the CLI and UI can render.
-    Every threshold parameter accepts None to disable that filter/split.
+    Returns the data dict the UI renders.
 
-    `divisions` is an optional iterable of division keys; if None, every
-    cached division is included.
+    `pitch_families`, `location`, `platoon`, `p_throws_filter` are pitch-level
+    *slicers*: they restrict which first-pitch offspeed pitches contribute to
+    the headline stats, breakdowns, regressions, and per-pitch table. They do
+    NOT change which pitchers are eligible — that's controlled by the
+    pitcher-level gates (`velo_floor`, `min_fastballs`, `min_4seam`,
+    `min_offspeed`).
+
+    `min_swings` / `min_pitches` are sample-size gates on the *filtered*
+    counts: a pitcher needs at least that many qualifying swings/pitches
+    *under the active slicer* to be included.
     """
     df = load_pitches(divisions=divisions)
 
-    # Coerce min_* to ints — None means 0
     min_fastballs = int(min_fastballs or 0)
     min_4seam = int(min_4seam or 0)
     min_offspeed = int(min_offspeed or 0)
     min_swings = int(min_swings or 0)
     min_pitches = int(min_pitches or 0)
 
-    # 1) Per-pitcher metrics
+    # 1) Per-pitcher metrics (always on FULL data — these are the X-vars and
+    # the eligibility inputs; they shouldn't move when a slicer changes).
     fb = df[df["pitch_type"].isin(FASTBALL_TYPES)]
     fb_grouped = fb.groupby("pitcher")["release_speed"]
     avg_fb_velo = fb_grouped.mean()
@@ -242,167 +336,172 @@ def compute_buckets(
     avg_ff_ivb = ff_grouped.mean() * 12
     ff_count = ff_grouped.size()
 
-    # Per-pitcher offspeed IVB (over every non-fastball/cutter pitch).
     is_offspeed_pitch = ~df["pitch_type"].isin(NON_OFFSPEED) & df["pitch_type"].notna()
-    os_pitches_df = df[is_offspeed_pitch]
-    os_grouped = os_pitches_df.groupby("pitcher")["pfx_z"]
+    os_grouped = df[is_offspeed_pitch].groupby("pitcher")["pfx_z"]
     avg_os_ivb = os_grouped.mean() * 12
     os_count = os_grouped.size()
 
-    # Per-pitcher vertical separation = 4-seam IVB - offspeed IVB (inches).
-    # Positive (typical) means the fastball rises more than the offspeed —
-    # bigger values = more vertical contrast between the two pitch families.
     avg_vsep = (avg_ff_ivb - avg_os_ivb).dropna()
 
-    # 2) First-pitch offspeed slice & per-pitcher swing/whiff counts
-    # (computed before eligibility so we can gate on min_swings)
-    is_first = df["pitch_number"] == 1
-    first_offspeed = df[is_first & is_offspeed_pitch]
-    fo_swings = first_offspeed[first_offspeed["description"].isin(SWING_DESCRIPTIONS)]
-    fo_whiffs = fo_swings[fo_swings["description"].str.startswith("swinging_strike")]
-    fo_called = first_offspeed[first_offspeed["description"] == CALLED_STRIKE_DESCRIPTION]
-    pitches_pp = first_offspeed.groupby("pitcher").size()
-    swings_pp = fo_swings.groupby("pitcher").size()
-    whiffs_pp = fo_whiffs.groupby("pitcher").size()
-    called_pp = fo_called.groupby("pitcher").size()
-
-    # 3) Eligibility
+    # 2) Pitcher eligibility (full-data based). Slicers don't move this set.
     elig_mask = fb_count >= min_fastballs
     if velo_floor is not None:
         elig_mask = elig_mask & (avg_fb_velo >= velo_floor)
-        excluded_below_floor = avg_fb_velo[(fb_count >= min_fastballs) & (avg_fb_velo < velo_floor)]
+        excluded_below_floor = avg_fb_velo[
+            (fb_count >= min_fastballs) & (avg_fb_velo < velo_floor)
+        ]
     else:
         excluded_below_floor = pd.Series(dtype=float)
-    if min_swings > 0:
-        # Reindex swings_pp to align with avg_fb_velo so missing pitchers count as 0 swings
-        swings_aligned = swings_pp.reindex(avg_fb_velo.index, fill_value=0)
-        elig_mask = elig_mask & (swings_aligned >= min_swings)
-    if min_pitches > 0:
-        pitches_aligned = pitches_pp.reindex(avg_fb_velo.index, fill_value=0)
-        elig_mask = elig_mask & (pitches_aligned >= min_pitches)
-    eligible = avg_fb_velo[elig_mask]
-    eligible_ids = set(eligible.index)
+    eligible_ids_full = set(avg_fb_velo[elig_mask].index)
 
     name_col = "pitcher_name" if "pitcher_name" in df.columns else "player_name"
     first_seen = df.drop_duplicates("pitcher").set_index("pitcher")
     name_map = first_seen[name_col].to_dict()
     division_map = first_seen["division"].to_dict() if "division" in df.columns else {}
 
-    def _roster(ids):
+    # 3) First-pitch offspeed slice (pre-slicer), augmented with the
+    # slicer dimension columns once so we can filter cheaply.
+    is_first = df["pitch_number"] == 1
+    fo_all = df[is_first & is_offspeed_pitch & df["pitcher"].isin(eligible_ids_full)].copy()
+    fo_all["in_zone"] = (fo_all["zone"] <= 9).astype("Int64")
+    fo_all["same_hand"] = (fo_all["p_throws"] == fo_all["stand"]).astype("Int64")
+    fo_all["pitch_family"] = fo_all["pitch_type"].map(_pitch_family)
+
+    # 4) Apply pitch-level slicers
+    fo = fo_all
+    if pitch_families:
+        fo = fo[fo["pitch_family"].isin(pitch_families)]
+    if location == "in":
+        fo = fo[fo["in_zone"] == 1]
+    elif location == "out":
+        fo = fo[fo["in_zone"] == 0]
+    if platoon == "same":
+        fo = fo[fo["same_hand"] == 1]
+    elif platoon == "opp":
+        fo = fo[fo["same_hand"] == 0]
+    if p_throws_filter in ("L", "R"):
+        fo = fo[fo["p_throws"] == p_throws_filter]
+
+    # 5) Per-pitcher swing/whiff counts on FILTERED data
+    fo_swings_df = fo[fo["description"].isin(SWING_DESCRIPTIONS)]
+    fo_whiffs_df = fo_swings_df[fo_swings_df["description"].str.startswith("swinging_strike")]
+    fo_called_df = fo[fo["description"] == CALLED_STRIKE_DESCRIPTION]
+    pitches_pp = fo.groupby("pitcher").size()
+    swings_pp = fo_swings_df.groupby("pitcher").size()
+    whiffs_pp = fo_whiffs_df.groupby("pitcher").size()
+    called_pp = fo_called_df.groupby("pitcher").size()
+
+    # 6) Sample-size gate on filtered counts
+    eligible_ids = set(eligible_ids_full)
+    if min_swings > 0:
+        eligible_ids &= set(swings_pp[swings_pp >= min_swings].index)
+    if min_pitches > 0:
+        eligible_ids &= set(pitches_pp[pitches_pp >= min_pitches].index)
+
+    # 7) Per-pitcher rows (filtered cohort) — sorted by velo desc.
+    # Only include pitchers who actually have at least one pitch under the
+    # slicer; otherwise the scatter / roster fills up with empty rows.
+    per_pitcher = []
+    contributing_ids = sorted(
+        (pid for pid in eligible_ids if pitches_pp.get(pid, 0) > 0),
+        key=lambda p: -avg_fb_velo[p],
+    )
+    for pid in contributing_ids:
+        sw = int(swings_pp.get(pid, 0))
+        wh = int(whiffs_pp.get(pid, 0))
+        cs = int(called_pp.get(pid, 0))
+        pc = int(pitches_pp.get(pid, 0))
+        per_pitcher.append({
+            "id": int(pid),
+            "name": name_map.get(pid, str(pid)),
+            "division": division_map.get(pid),
+            "velo": float(avg_fb_velo[pid]),
+            "ivb": float(avg_ff_ivb[pid]) if pid in avg_ff_ivb.index else None,
+            "os_ivb": float(avg_os_ivb[pid]) if pid in avg_os_ivb.index else None,
+            "vsep": float(avg_vsep[pid]) if pid in avg_vsep.index else None,
+            "fo_pitches": pc,
+            "fo_swings": sw,
+            "fo_whiffs": wh,
+            "fo_called": cs,
+            "whiff_rate": round(wh / sw * 100, 1) if sw else None,
+            "csw_rate": round((wh + cs) / pc * 100, 1) if pc else None,
+        })
+
+    # 8) Headline summary on the filtered + eligible cohort. Counts the
+    # pitchers actually contributing under this slicer, not the full
+    # eligible roster.
+    fo_eligible = fo[fo["pitcher"].isin(eligible_ids)]
+    summary = _pitch_stats(fo_eligible)
+    summary["n_pitchers"] = int(fo_eligible["pitcher"].nunique()) if not fo_eligible.empty else 0
+    summary["n_eligible_total"] = len(eligible_ids)
+
+    # 9) Breakdowns — same metric across each slicer dimension within the
+    # filtered cohort. Lets the user compare across families / zone / platoon
+    # without losing the active filter context.
+    def _split(group_col, levels):
         rows = []
-        for pid in sorted(ids, key=lambda p: -avg_fb_velo[p]):
-            sw = int(swings_pp.get(pid, 0))
-            wh = int(whiffs_pp.get(pid, 0))
-            cs = int(called_pp.get(pid, 0))
-            pc = int(pitches_pp.get(pid, 0))
-            rows.append({
-                "id": int(pid),
-                "name": name_map.get(pid, str(pid)),
-                "division": division_map.get(pid),
-                "velo": float(avg_fb_velo[pid]),
-                "ivb": float(avg_ff_ivb[pid]) if pid in avg_ff_ivb.index else None,
-                "os_ivb": float(avg_os_ivb[pid]) if pid in avg_os_ivb.index else None,
-                "vsep": float(avg_vsep[pid]) if pid in avg_vsep.index else None,
-                "fo_pitches": pc,
-                "fo_swings": sw,
-                "fo_whiffs": wh,
-                "fo_called": cs,
-                "whiff_rate": round(wh / sw * 100, 1) if sw else None,
-                "csw_rate": round((wh + cs) / pc * 100, 1) if pc else None,
-            })
+        for label, mask in levels:
+            sub = fo_eligible[mask]
+            if sub.empty:
+                stats = _pitch_stats(sub)
+                n_pitchers = 0
+            else:
+                stats = _pitch_stats(sub)
+                n_pitchers = sub["pitcher"].nunique()
+            rows.append({"label": label, "stats": stats, "n_pitchers": n_pitchers})
         return rows
 
-    def _make_bucket(label, ids):
-        return {
-            "label": label,
-            "stats": _pitch_stats(first_offspeed[first_offspeed["pitcher"].isin(ids)]),
-            "roster": _roster(ids),
-        }
+    breakdowns = {
+        "by_family": _split("pitch_family", [
+            ("Slider",    fo_eligible["pitch_family"] == "slider"),
+            ("Changeup",  fo_eligible["pitch_family"] == "changeup"),
+            ("Curveball", fo_eligible["pitch_family"] == "curveball"),
+            ("Other",     fo_eligible["pitch_family"] == "other"),
+        ]),
+        "by_zone": _split("in_zone", [
+            ("In zone",     fo_eligible["in_zone"] == 1),
+            ("Out of zone", fo_eligible["in_zone"] == 0),
+        ]),
+        "by_platoon": _split("same_hand", [
+            ("Same hand", fo_eligible["same_hand"] == 1),
+            ("Opp hand",  fo_eligible["same_hand"] == 0),
+        ]),
+    }
 
-    # 4) Build comparisons dynamically based on which thresholds are enabled
-    comparisons = []
+    # 10) Per-pitch detail (filtered + eligible) with velo/vsep columns
+    velo_dict = avg_fb_velo.to_dict()
+    vsep_dict = avg_vsep.to_dict()
+    pitch_details = _build_pitch_details(
+        fo_eligible, name_map, division_map, velo_dict, vsep_dict
+    )
 
-    # Velo split (or single "All" bucket if velo threshold is off)
-    if velo_threshold is not None:
-        high_ids = set(eligible[eligible >= velo_threshold].index)
-        low_ids = set(eligible[eligible < velo_threshold].index)
-        comparisons.append({
-            "title": "Hard throwers vs. soft throwers",
-            "delta_label": "Δ (high − low)",
-            "buckets": [
-                _make_bucket(f"High-velo (>= {velo_threshold} mph)", high_ids),
-                _make_bucket(f"Low-velo  (<  {velo_threshold} mph)", low_ids),
-            ],
-        })
-        sub_split_ids = high_ids
-        sub_split_context = "Within hard throwers"
-    else:
-        comparisons.append({
-            "title": "All eligible pitchers",
-            "delta_label": None,
-            "buckets": [_make_bucket("All eligible", eligible_ids)],
-        })
-        sub_split_ids = eligible_ids
-        sub_split_context = "All eligible pitchers"
-
-    # Vertical separation sub-split (FF IVB - OS IVB).
-    # Needs both enough 4-seamers AND enough offspeed pitches to compute.
-    if vsep_threshold is not None:
-        with_vsep = {
-            pid for pid in sub_split_ids
-            if ff_count.get(pid, 0) >= min_4seam
-            and os_count.get(pid, 0) >= min_offspeed
-            and pid in avg_vsep.index
+    # 11) Regressions (WLS) on filtered per-pitcher data
+    per_pitcher_df = pd.DataFrame([
+        {
+            "id": p["id"],
+            "velo": p["velo"],
+            "vsep": p["vsep"] if p["vsep"] is not None else np.nan,
+            "whiff_rate": (p["fo_whiffs"] / p["fo_swings"] * 100) if p["fo_swings"] else np.nan,
+            "swings": p["fo_swings"],
         }
-        no_vsep = sub_split_ids - with_vsep
-        wide = {pid for pid in with_vsep if avg_vsep[pid] >= vsep_threshold}
-        narrow = with_vsep - wide
-        cmp = {
-            "title": f"{sub_split_context}: wide vs. narrow vertical separation",
-            "delta_label": "Δ (wide − narrow)",
-            "buckets": [
-                _make_bucket(f"VSep >= {vsep_threshold}\"", wide),
-                _make_bucket(f"VSep <  {vsep_threshold}\"", narrow),
-            ],
-        }
-        if no_vsep:
-            cmp["excluded_note"] = (
-                f"{len(no_vsep)} pitcher(s) excluded from vertical-separation split "
-                f"(fewer than {min_4seam} 4-seamers or {min_offspeed} offspeed pitches)"
-            )
-            cmp["excluded_roster"] = _roster(no_vsep)
-        comparisons.append(cmp)
+        for p in per_pitcher
+    ])
+    regression = _run_regression(per_pitcher_df)
+    regression_velo = _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0)
 
     excluded = [
         {"id": int(pid), "name": name_map.get(pid, str(pid)), "velo": float(velo)}
         for pid, velo in excluded_below_floor.sort_values().items()
     ]
-
     divisions_loaded = sorted(df["division"].dropna().unique().tolist()) if "division" in df.columns else []
-
-    # 5) Per-pitcher table for the regression — built from the same eligible
-    # set as the bucket comparisons, so the regression and the headline
-    # numbers stay consistent with the active sidebar filters.
-    reg_rows = []
-    for pid in eligible_ids:
-        sw = int(swings_pp.get(pid, 0))
-        wh = int(whiffs_pp.get(pid, 0))
-        reg_rows.append({
-            "id": int(pid),
-            "velo": float(avg_fb_velo[pid]),
-            "vsep": float(avg_vsep[pid]) if pid in avg_vsep.index else np.nan,
-            "whiff_rate": (wh / sw * 100) if sw else np.nan,
-        })
-    per_pitcher_df = pd.DataFrame(reg_rows)
-
-    regression = _run_regression(per_pitcher_df)
-    regression_velo = _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0)
 
     return {
         "params": {
-            "velo_threshold": velo_threshold,
+            "pitch_families": sorted(pitch_families) if pitch_families else None,
+            "location": location,
+            "platoon": platoon,
+            "p_throws_filter": p_throws_filter,
             "velo_floor": velo_floor,
-            "vsep_threshold": vsep_threshold,
             "min_fastballs": min_fastballs,
             "min_4seam": min_4seam,
             "min_offspeed": min_offspeed,
@@ -410,117 +509,56 @@ def compute_buckets(
             "min_pitches": min_pitches,
             "divisions": divisions_loaded,
         },
-        "comparisons": comparisons,
-        "excluded_below_floor": excluded,
+        "summary": summary,
+        "per_pitcher": per_pitcher,
+        "breakdowns": breakdowns,
+        "pitch_details": pitch_details,
         "regression": regression,
         "regression_velo": regression_velo,
+        "excluded_below_floor": excluded,
     }
 
 
-def whiff_rate_by_velo_bucket(
-    velo_threshold=95.0,
-    velo_floor=90.9,
-    vsep_threshold=18.0,
-    min_fastballs=50,
-    min_4seam=30,
-    min_offspeed=30,
-    min_swings=0,
-    min_pitches=0,
-    divisions=None,
-):
-    """
-    CLI report. Walks every comparison built by compute_buckets() — set any
-    threshold to None to disable that filter/split.
-    """
-    r = compute_buckets(
-        velo_threshold=velo_threshold,
-        velo_floor=velo_floor,
-        vsep_threshold=vsep_threshold,
-        min_fastballs=min_fastballs,
-        min_4seam=min_4seam,
-        min_offspeed=min_offspeed,
-        min_swings=min_swings,
-        min_pitches=min_pitches,
-        divisions=divisions,
-    )
+def print_summary(divisions=None):
+    """Lightweight CLI sanity check — prints the headline stats on full
+    (unfiltered) data so you can spot-check `compute()` from a terminal."""
+    r = compute(divisions=divisions)
     p = r["params"]
-
-    def _fmt(v, suffix=""):
-        return f"{v}{suffix}" if v is not None else "OFF"
-
-    print("=== First-Pitch Offspeed Whiff Rate ===")
-    print(f"Divisions loaded:  {p['divisions'] or '(none tagged)'}")
-    print(f"Velo threshold:    {_fmt(p['velo_threshold'], ' mph')}   "
-          f"|  velo floor: {_fmt(p['velo_floor'], ' mph')}")
-    print(f"VSep threshold:    {_fmt(p['vsep_threshold'], ' in')}     "
-          f"(needs >= {p['min_4seam']} FF and >= {p['min_offspeed']} OS pitches)")
-    print(f"Min fastballs:     {p['min_fastballs']}    |  min 1st-pitch OS swings: {p['min_swings']}    "
-          f"|  min 1st-pitch OS pitches: {p['min_pitches']}")
-    print(f"VSep = avg 4-seam IVB - avg offspeed IVB (positive = fastball rises more)")
-    print(f"Fastball = {sorted(FASTBALL_TYPES)}, "
-          f"Offspeed = anything NOT in {sorted(NON_OFFSPEED)}")
-    print(f"Whiff rate = swinging strikes / total swings")
-    print(f"CSW% = (called strikes + whiffs) / total pitches\n")
-
-    if r["excluded_below_floor"]:
-        print(f"Excluded {len(r['excluded_below_floor'])} pitcher(s) below velo floor:")
-        for x in r["excluded_below_floor"]:
-            print(f"  {x['velo']:5.1f}  {x['name']}")
+    s = r["summary"]
+    print("=== First-Pitch Offspeed Whiff Rate (unfiltered) ===")
+    print(f"Divisions loaded: {p['divisions'] or '(none tagged)'}")
+    print(f"Velo floor: {p['velo_floor']} mph | min fastballs: {p['min_fastballs']}")
+    print()
+    print(f"Pitchers (eligible): {s['n_pitchers']}")
+    print(f"First-pitch offspeed pitches: {s['pitches']:,}")
+    print(f"  swings: {s['swings']:,}  whiffs: {s['whiffs']:,}  called: {s['called_strikes']:,}")
+    print(f"  whiff%: {s['whiff_rate']}    CSW%: {s['csw_rate']}")
+    print()
+    print("=== Breakdowns ===")
+    for key, label in (("by_family", "Pitch family"),
+                       ("by_zone",   "Location"),
+                       ("by_platoon", "Platoon")):
+        print(f"-- {label} --")
+        for row in r["breakdowns"][key]:
+            st = row["stats"]
+            wr = f"{st['whiff_rate']}%" if st["swings"] else "n/a"
+            csw = f"{st['csw_rate']}%" if st["pitches"] else "n/a"
+            print(f"  {row['label']:11s}  pitches={st['pitches']:5d}  swings={st['swings']:5d}  "
+                  f"whiff%={wr:>6s}  CSW%={csw:>6s}")
         print()
-
-    def _print_bucket(bucket):
-        s = bucket["stats"]
-        print(f"  {bucket['label']}: {len(bucket['roster'])} pitchers")
-        print(f"    first-pitch offspeed: {s['pitches']} pitches, {s['swings']} swings, "
-              f"{s['whiffs']} whiffs, {s['called_strikes']} called strikes")
-        print(f"    whiff rate: {s['whiff_rate']}%" if s['swings'] else "    whiff rate: n/a (no swings)")
-        print(f"    CSW%:       {s['csw_rate']}%" if s['pitches'] else "    CSW%:       n/a (no pitches)")
-
-    def _print_roster(label, roster):
-        print(f"\n  {label} ({len(roster)}):")
-        for x in roster:
-            ivb_str = f"  FF-IVB {x['ivb']:5.1f}\"" if x.get("ivb") is not None else ""
-            os_ivb_str = f"  OS-IVB {x['os_ivb']:5.1f}\"" if x.get("os_ivb") is not None else ""
-            vsep_str = f"  VSep {x['vsep']:5.1f}\"" if x.get("vsep") is not None else ""
-            wr = (f"{x['whiff_rate']:5.1f}% ({x['fo_whiffs']}/{x['fo_swings']})"
-                  if x.get("whiff_rate") is not None else "  n/a (0 swings)")
-            csw = (f"{x['csw_rate']:5.1f}% ({x['fo_whiffs'] + x['fo_called']}/{x['fo_pitches']})"
-                   if x.get("csw_rate") is not None else "  n/a (0 pitches)")
-            print(f"    {x['velo']:5.1f}{ivb_str}{os_ivb_str}{vsep_str}  whiff {wr}  CSW {csw}  {x['name']}")
-
-    for cmp in r["comparisons"]:
-        print(f"=== {cmp['title']} ===")
-        for bucket in cmp["buckets"]:
-            _print_bucket(bucket)
-        if cmp.get("excluded_note"):
-            print(f"  -- {cmp['excluded_note']}")
-        if len(cmp["buckets"]) == 2:
-            a, b = cmp["buckets"]
-            sa, sb = a["stats"], b["stats"]
-            for metric_label, key, gate in (("whiff", "whiff_rate", "swings"),
-                                            ("CSW", "csw_rate", "pitches")):
-                if sa[gate] and sb[gate]:
-                    diff = sa[key] - sb[key]
-                    verdict = "HIGHER" if diff > 0 else ("LOWER" if diff < 0 else "EQUAL")
-                    print(f"  >>> {metric_label}: {a['label']} is {abs(diff):.1f} pp {verdict} than {b['label']}")
-        print()
-
-    print("=== Rosters ===")
-    seen_labels = set()
-    for cmp in r["comparisons"]:
-        for bucket in cmp["buckets"]:
-            if bucket["label"] in seen_labels:
-                continue
-            seen_labels.add(bucket["label"])
-            _print_roster(bucket["label"], bucket["roster"])
-        if cmp.get("excluded_roster"):
-            _print_roster(f"{cmp['title']} — excluded", cmp["excluded_roster"])
-
+    print("=== Regressions ===")
+    for tag, reg in (("vsep only", r["regression"]),
+                     ("vsep + high_velo", r["regression_velo"])):
+        if reg.get("skipped_reason"):
+            print(f"{tag}: SKIPPED — {reg['skipped_reason']}")
+            continue
+        print(f"{tag}: n={reg['n']} R²={reg['r_squared']:.3f} ({reg.get('fit_method')})")
+        for c in reg["coefficients"]:
+            print(f"  {c['name']:>10s}  beta={c['coef']:+.3f}  se={c['std_err']:.3f}  p={c['p_value']:.4f}")
     return r
 
 
 if __name__ == "__main__":
     import sys
-    # Optional CLI: `python -m reports.first_pitch_offspeed.analyze nl_east al_west`
     cli_divs = sys.argv[1:] if len(sys.argv) > 1 else None
-    whiff_rate_by_velo_bucket(divisions=cli_divs)
+    print_summary(divisions=cli_divs)
