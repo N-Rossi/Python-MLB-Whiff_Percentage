@@ -413,10 +413,72 @@ else:
     display_df["Velo (mph)"] = pd.to_numeric(display_df["Velo (mph)"], errors="coerce").round(1)
     display_df["VSep (in)"] = pd.to_numeric(display_df["VSep (in)"], errors="coerce").round(1)
 
-    sort_options = ["Pitcher", "Pitch family", "P-hand", "Div", "Date"]
-    sort_by = st.selectbox("Sort by", sort_options, index=0)
-    if sort_by in display_df.columns:
-        display_df = display_df.sort_values([sort_by, "Pitcher"], na_position="last")
+    def _apply_filters(df, pitcher=None, div=None, fam=None, matchup=None):
+        out = df
+        if pitcher and pitcher != "All":
+            out = out[out["Pitcher"] == pitcher]
+        if div and div != "All":
+            out = out[out["Div"] == div]
+        if fam and fam != "All":
+            out = out[out["Pitch family"] == fam]
+        if matchup and matchup != "All":
+            p, b = matchup.split("/")
+            out = out[(out["P-hand"] == p) & (out["B-stand"] == b)]
+        return out
+
+    def _matchup_opts(df):
+        pairs = df[["P-hand", "B-stand"]].dropna().drop_duplicates()
+        return sorted(f"{p}/{b}" for p, b in pairs.itertuples(index=False))
+
+    for _k in ("filter_pitcher", "filter_div", "filter_fam", "filter_matchup"):
+        st.session_state.setdefault(_k, "All")
+
+    pitcher_pick = st.session_state["filter_pitcher"]
+    div_pick = st.session_state["filter_div"]
+    fam_pick = st.session_state["filter_fam"]
+    matchup_pick = st.session_state["filter_matchup"]
+
+    pitcher_opts = ["All"] + sorted(
+        _apply_filters(display_df, div=div_pick, fam=fam_pick, matchup=matchup_pick)
+        ["Pitcher"].dropna().unique().tolist()
+    )
+    div_opts = ["All"] + sorted(
+        _apply_filters(display_df, pitcher=pitcher_pick, fam=fam_pick, matchup=matchup_pick)
+        ["Div"].dropna().unique().tolist()
+    )
+    fam_opts = ["All"] + sorted(
+        _apply_filters(display_df, pitcher=pitcher_pick, div=div_pick, matchup=matchup_pick)
+        ["Pitch family"].dropna().unique().tolist()
+    )
+    matchup_opts = ["All"] + _matchup_opts(
+        _apply_filters(display_df, pitcher=pitcher_pick, div=div_pick, fam=fam_pick)
+    )
+
+    if pitcher_pick not in pitcher_opts:
+        st.session_state["filter_pitcher"] = "All"
+    if div_pick not in div_opts:
+        st.session_state["filter_div"] = "All"
+    if fam_pick not in fam_opts:
+        st.session_state["filter_fam"] = "All"
+    if matchup_pick not in matchup_opts:
+        st.session_state["filter_matchup"] = "All"
+
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    with fc1:
+        pitcher_pick = st.selectbox("Pitcher", pitcher_opts, key="filter_pitcher")
+    with fc2:
+        div_pick = st.selectbox("Division", div_opts, key="filter_div")
+    with fc3:
+        fam_pick = st.selectbox("Pitch family", fam_opts, key="filter_fam")
+    with fc4:
+        matchup_pick = st.selectbox(
+            "Handedness matchup (P/B)", matchup_opts, key="filter_matchup"
+        )
+
+    display_df = _apply_filters(
+        display_df, pitcher=pitcher_pick, div=div_pick, fam=fam_pick, matchup=matchup_pick
+    )
+    display_df = display_df.sort_values(["Pitcher", "Date"], na_position="last")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
     st.caption(f"{len(display_df):,} pitch rows.")
 
