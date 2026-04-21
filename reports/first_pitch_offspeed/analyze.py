@@ -221,29 +221,32 @@ def _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0):
     }
 
 
-# Pitch-type families used to label each pitch row. Reference / "other"
-# = anything offspeed not in these three sets (sweeper ST, knuckle-curve KC,
-# splitter FS, slurve SV, etc.).
-PITCH_TYPE_FAMILIES = {
-    "slider":    {"SL"},
-    "changeup":  {"CH"},
-    "curveball": {"CU"},
+# Statcast offspeed pitch_type codes → human-readable labels. Drives the
+# sidebar multiselect, the per-pitch detail filter, and the abbreviation key
+# rendered under the detail filters.
+PITCH_TYPE_LABELS = {
+    "SL": "Slider",
+    "ST": "Sweeper",
+    "SV": "Slurve",
+    "CH": "Changeup",
+    "CU": "Curveball",
+    "KC": "Knuckle-curve",
+    "CS": "Slow curve",
+    "FS": "Splitter",
+    "FO": "Forkball",
+    "SC": "Screwball",
+    "KN": "Knuckleball",
+    "EP": "Eephus",
 }
-
-
-def _pitch_family(code):
-    for fam, codes in PITCH_TYPE_FAMILIES.items():
-        if code in codes:
-            return fam
-    return "other"
+OFFSPEED_PITCH_TYPES = tuple(PITCH_TYPE_LABELS.keys())
 
 
 def _build_pitch_details(d, name_map, division_map, velo_dict, vsep_dict):
     """
     One row per first-pitch offspeed pitch (already filtered by the caller).
-    Assumes `d` already has `in_zone`, `same_hand`, and `pitch_family` cols.
-    Adds the pitcher's avg FB velo and VSep so each row carries the X-vars
-    from the regression alongside the pitch-level slicer columns.
+    Assumes `d` already has `in_zone` and `same_hand` cols. Adds the pitcher's
+    avg FB velo and VSep so each row carries the X-vars from the regression
+    alongside the pitch-level slicer columns.
     """
     if d.empty:
         return []
@@ -269,7 +272,6 @@ def _build_pitch_details(d, name_map, division_map, velo_dict, vsep_dict):
             "velo": float(velo_dict[pid]) if pid in velo_dict else None,
             "vsep": float(vsep_dict[pid]) if pid in vsep_dict else None,
             "pitch_type": rd.get("pitch_type"),
-            "pitch_family": rd.get("pitch_family"),
             "p_throws": rd.get("p_throws"),
             "stand": rd.get("stand"),
             "in_zone": int(rd["in_zone"]) if pd.notna(rd["in_zone"]) else None,
@@ -286,11 +288,10 @@ def _build_pitch_details(d, name_map, division_map, velo_dict, vsep_dict):
 LOCATION_OPTIONS = (None, "in", "out")
 PLATOON_OPTIONS = (None, "same", "opp")
 P_THROWS_OPTIONS = (None, "L", "R")
-ALL_FAMILIES = ("slider", "changeup", "curveball", "other")
 
 
 def compute(
-    pitch_families=None,    # None -> all four families
+    pitch_types=None,       # None -> all offspeed pitch_types
     location=None,          # None / "in" / "out"
     platoon=None,           # None / "same" / "opp"
     p_throws_filter=None,   # None / "L" / "R"
@@ -305,7 +306,7 @@ def compute(
     """
     Returns the data dict the UI renders.
 
-    `pitch_families`, `location`, `platoon`, `p_throws_filter` are pitch-level
+    `pitch_types`, `location`, `platoon`, `p_throws_filter` are pitch-level
     *slicers*: they restrict which first-pitch offspeed pitches contribute to
     the headline stats, breakdowns, regressions, and per-pitch table. They do
     NOT change which pitchers are eligible — that's controlled by the
@@ -336,7 +337,7 @@ def compute(
     avg_ff_ivb = ff_grouped.mean() * 12
     ff_count = ff_grouped.size()
 
-    is_offspeed_pitch = ~df["pitch_type"].isin(NON_OFFSPEED) & df["pitch_type"].notna()
+    is_offspeed_pitch = df["pitch_type"].isin(OFFSPEED_PITCH_TYPES)
     os_grouped = df[is_offspeed_pitch].groupby("pitcher")["pfx_z"]
     avg_os_ivb = os_grouped.mean() * 12
     os_count = os_grouped.size()
@@ -365,12 +366,11 @@ def compute(
     fo_all = df[is_first & is_offspeed_pitch & df["pitcher"].isin(eligible_ids_full)].copy()
     fo_all["in_zone"] = (fo_all["zone"] <= 9).astype("Int64")
     fo_all["same_hand"] = (fo_all["p_throws"] == fo_all["stand"]).astype("Int64")
-    fo_all["pitch_family"] = fo_all["pitch_type"].map(_pitch_family)
 
     # 4) Apply pitch-level slicers
     fo = fo_all
-    if pitch_families:
-        fo = fo[fo["pitch_family"].isin(pitch_families)]
+    if pitch_types:
+        fo = fo[fo["pitch_type"].isin(pitch_types)]
     if location == "in":
         fo = fo[fo["in_zone"] == 1]
     elif location == "out":
@@ -451,13 +451,17 @@ def compute(
             rows.append({"label": label, "stats": stats, "n_pitchers": n_pitchers})
         return rows
 
+    pt_levels = []
+    if not fo_eligible.empty:
+        present_types = (
+            fo_eligible["pitch_type"].dropna().value_counts().index.tolist()
+        )
+        for pt in present_types:
+            label = f"{PITCH_TYPE_LABELS.get(pt, pt)} ({pt})"
+            pt_levels.append((label, fo_eligible["pitch_type"] == pt))
+
     breakdowns = {
-        "by_family": _split("pitch_family", [
-            ("Slider",    fo_eligible["pitch_family"] == "slider"),
-            ("Changeup",  fo_eligible["pitch_family"] == "changeup"),
-            ("Curveball", fo_eligible["pitch_family"] == "curveball"),
-            ("Other",     fo_eligible["pitch_family"] == "other"),
-        ]),
+        "by_pitch_type": _split("pitch_type", pt_levels),
         "by_zone": _split("in_zone", [
             ("In zone",     fo_eligible["in_zone"] == 1),
             ("Out of zone", fo_eligible["in_zone"] == 0),
@@ -497,7 +501,7 @@ def compute(
 
     return {
         "params": {
-            "pitch_families": sorted(pitch_families) if pitch_families else None,
+            "pitch_types": sorted(pitch_types) if pitch_types else None,
             "location": location,
             "platoon": platoon,
             "p_throws_filter": p_throws_filter,
@@ -535,9 +539,9 @@ def print_summary(divisions=None):
     print(f"  whiff%: {s['whiff_rate']}    CSW%: {s['csw_rate']}")
     print()
     print("=== Breakdowns ===")
-    for key, label in (("by_family", "Pitch family"),
-                       ("by_zone",   "Location"),
-                       ("by_platoon", "Platoon")):
+    for key, label in (("by_pitch_type", "Pitch type"),
+                       ("by_zone",       "Location"),
+                       ("by_platoon",    "Platoon")):
         print(f"-- {label} --")
         for row in r["breakdowns"][key]:
             st = row["stats"]

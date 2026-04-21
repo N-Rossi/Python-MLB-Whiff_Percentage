@@ -1,7 +1,7 @@
 """
 Streamlit page for the velo + IVB + CSW%/whiff-rate analysis.
 
-Sidebar drives PITCH-LEVEL slicers (pitch family / location / platoon /
+Sidebar drives PITCH-LEVEL slicers (pitch type / location / platoon /
 pitcher handedness / divisions). Velo and VSep are NOT slicers — they're the
 project's X variables, so they appear as columns in the per-pitch table and
 predictors in the regressions, not sliders that move the goalposts.
@@ -14,7 +14,8 @@ import streamlit as st
 from reports.first_pitch_offspeed.analyze import (
     compute,
     available_divisions,
-    ALL_FAMILIES,
+    OFFSPEED_PITCH_TYPES,
+    PITCH_TYPE_LABELS,
     FASTBALL_TYPES,
     NON_OFFSPEED,
 )
@@ -48,16 +49,18 @@ st.sidebar.caption(
     "the per-pitch table, not as slicers."
 )
 
-selected_families = st.sidebar.multiselect(
-    "Pitch family",
-    options=list(ALL_FAMILIES),
-    default=list(ALL_FAMILIES),
-    help="Slider = SL · Changeup = CH · Curveball = CU · Other = ST/KC/FS/SV/etc.",
+selected_pitch_types = st.sidebar.multiselect(
+    "Pitch type",
+    options=list(OFFSPEED_PITCH_TYPES),
+    default=list(OFFSPEED_PITCH_TYPES),
+    format_func=lambda c: f"{c} — {PITCH_TYPE_LABELS.get(c, c)}",
+    help="Statcast pitch_type codes. Filter to sweepers (ST), slurves (SV), "
+         "splitters (FS), etc. instead of rolling them into a single family.",
 )
-if not selected_families:
-    st.warning("Pick at least one pitch family in the sidebar.")
+if not selected_pitch_types:
+    st.warning("Pick at least one pitch type in the sidebar.")
     st.stop()
-all_families_selected = set(selected_families) == set(ALL_FAMILIES)
+all_types_selected = set(selected_pitch_types) == set(OFFSPEED_PITCH_TYPES)
 
 LOC_LABELS = {"All": None, "In zone (1–9)": "in", "Out of zone (11–14)": "out"}
 loc_label = st.sidebar.radio(
@@ -127,7 +130,7 @@ st.sidebar.caption(
 
 # --- Compute ---
 result = compute(
-    pitch_families=set(selected_families) if not all_families_selected else None,
+    pitch_types=set(selected_pitch_types) if not all_types_selected else None,
     location=location,
     platoon=platoon,
     p_throws_filter=p_throws_filter,
@@ -143,8 +146,8 @@ result = compute(
 
 def _slicer_summary():
     parts = []
-    if not all_families_selected:
-        parts.append("families: " + " / ".join(sorted(selected_families)))
+    if not all_types_selected:
+        parts.append("pitch types: " + " / ".join(sorted(selected_pitch_types)))
     if location:
         parts.append("zone: " + ("in" if location == "in" else "out"))
     if platoon:
@@ -210,8 +213,8 @@ def _breakdown_df(rows):
 
 bc1, bc2, bc3 = st.columns(3)
 with bc1:
-    st.subheader("By pitch family")
-    st.dataframe(_breakdown_df(result["breakdowns"]["by_family"]),
+    st.subheader("By pitch type")
+    st.dataframe(_breakdown_df(result["breakdowns"]["by_pitch_type"]),
                  use_container_width=True, hide_index=True)
 with bc2:
     st.subheader("By location")
@@ -374,7 +377,7 @@ st.header("Per-pitch detail")
 st.caption(
     "One row per first-pitch offspeed pitch in the filtered cohort. Each row "
     "carries the pitcher's `Velo` and `VSep` (the X-vars), the pitch-level "
-    "slicer columns (`Pitch family`, `In zone`, `Same hand`), and the outcome "
+    "slicer columns (`Pitch type`, `In zone`, `Same hand`), and the outcome "
     "flags (`Swing`, `Whiff`, `Called strike`)."
 )
 
@@ -389,7 +392,6 @@ else:
         "velo": "Velo (mph)",
         "vsep": "VSep (in)",
         "pitch_type": "Pitch type",
-        "pitch_family": "Pitch family",
         "p_throws": "P-hand",
         "stand": "B-stand",
         "in_zone": "In zone",
@@ -401,7 +403,7 @@ else:
     }
     cols_order = [
         "Pitcher", "Div", "Date", "Velo (mph)", "VSep (in)",
-        "Pitch type", "Pitch family", "P-hand", "B-stand",
+        "Pitch type", "P-hand", "B-stand",
         "Same hand", "In zone", "Description",
         "Swing", "Whiff", "Called strike",
     ]
@@ -413,14 +415,14 @@ else:
     display_df["Velo (mph)"] = pd.to_numeric(display_df["Velo (mph)"], errors="coerce").round(1)
     display_df["VSep (in)"] = pd.to_numeric(display_df["VSep (in)"], errors="coerce").round(1)
 
-    def _apply_filters(df, pitcher=None, div=None, fam=None, matchup=None):
+    def _apply_filters(df, pitcher=None, div=None, ptype=None, matchup=None):
         out = df
         if pitcher and pitcher != "All":
             out = out[out["Pitcher"] == pitcher]
         if div and div != "All":
             out = out[out["Div"] == div]
-        if fam and fam != "All":
-            out = out[out["Pitch family"] == fam]
+        if ptype and ptype != "All":
+            out = out[out["Pitch type"] == ptype]
         if matchup and matchup != "All":
             p, b = matchup.split("/")
             out = out[(out["P-hand"] == p) & (out["B-stand"] == b)]
@@ -430,53 +432,65 @@ else:
         pairs = df[["P-hand", "B-stand"]].dropna().drop_duplicates()
         return sorted(f"{p}/{b}" for p, b in pairs.itertuples(index=False))
 
-    for _k in ("filter_pitcher", "filter_div", "filter_fam", "filter_matchup"):
+    for _k in ("filter_pitcher", "filter_div", "filter_ptype", "filter_matchup"):
         st.session_state.setdefault(_k, "All")
 
     pitcher_pick = st.session_state["filter_pitcher"]
     div_pick = st.session_state["filter_div"]
-    fam_pick = st.session_state["filter_fam"]
+    ptype_pick = st.session_state["filter_ptype"]
     matchup_pick = st.session_state["filter_matchup"]
 
     pitcher_opts = ["All"] + sorted(
-        _apply_filters(display_df, div=div_pick, fam=fam_pick, matchup=matchup_pick)
+        _apply_filters(display_df, div=div_pick, ptype=ptype_pick, matchup=matchup_pick)
         ["Pitcher"].dropna().unique().tolist()
     )
     div_opts = ["All"] + sorted(
-        _apply_filters(display_df, pitcher=pitcher_pick, fam=fam_pick, matchup=matchup_pick)
+        _apply_filters(display_df, pitcher=pitcher_pick, ptype=ptype_pick, matchup=matchup_pick)
         ["Div"].dropna().unique().tolist()
     )
-    fam_opts = ["All"] + sorted(
+    ptype_opts = ["All"] + sorted(
         _apply_filters(display_df, pitcher=pitcher_pick, div=div_pick, matchup=matchup_pick)
-        ["Pitch family"].dropna().unique().tolist()
+        ["Pitch type"].dropna().unique().tolist()
     )
     matchup_opts = ["All"] + _matchup_opts(
-        _apply_filters(display_df, pitcher=pitcher_pick, div=div_pick, fam=fam_pick)
+        _apply_filters(display_df, pitcher=pitcher_pick, div=div_pick, ptype=ptype_pick)
     )
 
     if pitcher_pick not in pitcher_opts:
         st.session_state["filter_pitcher"] = "All"
     if div_pick not in div_opts:
         st.session_state["filter_div"] = "All"
-    if fam_pick not in fam_opts:
-        st.session_state["filter_fam"] = "All"
+    if ptype_pick not in ptype_opts:
+        st.session_state["filter_ptype"] = "All"
     if matchup_pick not in matchup_opts:
         st.session_state["filter_matchup"] = "All"
 
     fc1, fc2, fc3, fc4 = st.columns(4)
     with fc1:
-        pitcher_pick = st.selectbox("Pitcher", pitcher_opts, key="filter_pitcher")
-    with fc2:
         div_pick = st.selectbox("Division", div_opts, key="filter_div")
+    with fc2:
+        pitcher_pick = st.selectbox("Pitcher", pitcher_opts, key="filter_pitcher")
     with fc3:
-        fam_pick = st.selectbox("Pitch family", fam_opts, key="filter_fam")
+        ptype_pick = st.selectbox(
+            "Pitch type",
+            ptype_opts,
+            key="filter_ptype",
+            format_func=lambda c: c if c == "All" else f"{c} — {PITCH_TYPE_LABELS.get(c, c)}",
+        )
     with fc4:
         matchup_pick = st.selectbox(
             "Handedness matchup (P/B)", matchup_opts, key="filter_matchup"
         )
 
+    present_types = sorted(display_df["Pitch type"].dropna().unique().tolist())
+    if present_types:
+        key_str = " · ".join(
+            f"**{c}** = {PITCH_TYPE_LABELS.get(c, c)}" for c in present_types
+        )
+        st.caption(f"Pitch type key — {key_str}")
+
     display_df = _apply_filters(
-        display_df, pitcher=pitcher_pick, div=div_pick, fam=fam_pick, matchup=matchup_pick
+        display_df, pitcher=pitcher_pick, div=div_pick, ptype=ptype_pick, matchup=matchup_pick
     )
     display_df = display_df.sort_values(["Pitcher", "Date"], na_position="last")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
