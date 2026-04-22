@@ -12,7 +12,6 @@ import re
 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 PITCHES_GLOB = "*_starters_*_pitches.parquet"
@@ -99,128 +98,6 @@ def _pitch_stats(d):
     }
 
 
-def _fit_weighted_or_ols(y, X, weights=None):
-    """WLS when valid positive weights are provided, else plain OLS."""
-    if weights is not None:
-        w = pd.Series(weights).fillna(0).to_numpy()
-        if (w > 0).any():
-            return sm.WLS(y, X, weights=w).fit(), "WLS (weighted by swings)"
-    return sm.OLS(y, X).fit(), "OLS (unweighted)"
-
-
-def _run_regression(per_pitcher_df):
-    """
-    Bivariate WLS: Y = per-pitcher first-pitch offspeed whiff%,
-    X = vsep (in). Each pitcher weighted by their first-pitch OS swing
-    count, so high-sample pitchers get more pull and low-sample pitchers
-    don't drag the slope around with noisy whiff%.
-    """
-    df = per_pitcher_df.dropna(subset=["whiff_rate", "vsep"]).copy()
-    n = len(df)
-    if n < 4:
-        return {
-            "n": n,
-            "skipped_reason": (
-                f"Need >= 4 pitchers with a defined whiff% and VSep to fit "
-                f"the regression (have {n}). Loosen sample-size gates or add "
-                f"more divisions."
-            ),
-        }
-
-    X = sm.add_constant(df[["vsep"]])
-    y = df["whiff_rate"]
-    weights = df["swings"] if "swings" in df.columns else None
-    model, fit_method = _fit_weighted_or_ols(y, X, weights=weights)
-
-    ci = model.conf_int()
-    pretty = {
-        "const": "Intercept (vsep = 0)",
-        "vsep": "VSep (in) — variable of interest",
-    }
-    coefficients = [
-        {
-            "name": name,
-            "label": pretty[name],
-            "coef": float(model.params[name]),
-            "std_err": float(model.bse[name]),
-            "t": float(model.tvalues[name]),
-            "p_value": float(model.pvalues[name]),
-            "ci_lower": float(ci.loc[name, 0]),
-            "ci_upper": float(ci.loc[name, 1]),
-        }
-        for name in ["const", "vsep"]
-    ]
-
-    return {
-        "n": n,
-        "fit_method": fit_method,
-        "total_weight": float(weights.sum()) if weights is not None else None,
-        "r_squared": float(model.rsquared),
-        "adj_r_squared": float(model.rsquared_adj),
-        "f_statistic": float(model.fvalue) if model.fvalue is not None else None,
-        "f_p_value": float(model.f_pvalue) if model.f_pvalue is not None else None,
-        "coefficients": coefficients,
-    }
-
-
-def _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0):
-    """
-    WLS: Y = per-pitcher first-pitch offspeed whiff%,
-    X = vsep (continuous, in) + high_velo (1 if avg FB >= velo_cut mph).
-    Adds high_velo as a control on top of the bivariate vsep model.
-    """
-    df = per_pitcher_df.dropna(subset=["whiff_rate", "vsep", "velo"]).copy()
-    n = len(df)
-    if n < 4:
-        return {
-            "n": n,
-            "skipped_reason": (
-                f"Need >= 4 pitchers with a defined whiff%, VSep, and velo "
-                f"to fit the regression (have {n})."
-            ),
-            "velo_cut": velo_cut,
-        }
-
-    df["high_velo"] = (df["velo"] >= velo_cut).astype(int)
-
-    X = sm.add_constant(df[["vsep", "high_velo"]])
-    y = df["whiff_rate"]
-    weights = df["swings"] if "swings" in df.columns else None
-    model, fit_method = _fit_weighted_or_ols(y, X, weights=weights)
-
-    ci = model.conf_int()
-    pretty = {
-        "const": "Intercept (low velo, vsep = 0)",
-        "vsep": "VSep (in) — variable of interest",
-        "high_velo": f"High velo (FB >= {velo_cut} mph)",
-    }
-    coefficients = [
-        {
-            "name": name,
-            "label": pretty[name],
-            "coef": float(model.params[name]),
-            "std_err": float(model.bse[name]),
-            "t": float(model.tvalues[name]),
-            "p_value": float(model.pvalues[name]),
-            "ci_lower": float(ci.loc[name, 0]),
-            "ci_upper": float(ci.loc[name, 1]),
-        }
-        for name in ["const", "vsep", "high_velo"]
-    ]
-
-    return {
-        "n": n,
-        "velo_cut": velo_cut,
-        "fit_method": fit_method,
-        "total_weight": float(weights.sum()) if weights is not None else None,
-        "r_squared": float(model.rsquared),
-        "adj_r_squared": float(model.rsquared_adj),
-        "f_statistic": float(model.fvalue) if model.fvalue is not None else None,
-        "f_p_value": float(model.f_pvalue) if model.f_pvalue is not None else None,
-        "coefficients": coefficients,
-    }
-
-
 # Statcast offspeed pitch_type codes → human-readable labels. Drives the
 # sidebar multiselect, the per-pitch detail filter, and the abbreviation key
 # rendered under the detail filters.
@@ -241,12 +118,12 @@ PITCH_TYPE_LABELS = {
 OFFSPEED_PITCH_TYPES = tuple(PITCH_TYPE_LABELS.keys())
 
 
-def _build_pitch_details(d, name_map, division_map, velo_dict, vsep_dict):
+def _build_pitch_details(d, name_map, team_map, velo_dict, vsep_dict):
     """
     One row per first-pitch offspeed pitch (already filtered by the caller).
     Assumes `d` already has `in_zone` and `same_hand` cols. Adds the pitcher's
-    avg FB velo and VSep so each row carries the X-vars from the regression
-    alongside the pitch-level slicer columns.
+    avg FB velo and VSep so each row carries those X-vars alongside the
+    pitch-level slicer columns.
     """
     if d.empty:
         return []
@@ -267,7 +144,7 @@ def _build_pitch_details(d, name_map, division_map, velo_dict, vsep_dict):
         rows.append({
             "pitcher_id": int(pid),
             "pitcher": name_map.get(pid, str(pid)),
-            "division": division_map.get(pid),
+            "team": team_map.get(pid),
             "game_date": str(rd.get("game_date")) if rd.get("game_date") is not None else None,
             "velo": float(velo_dict[pid]) if pid in velo_dict else None,
             "vsep": float(vsep_dict[pid]) if pid in vsep_dict else None,
@@ -308,8 +185,8 @@ def compute(
 
     `pitch_types`, `location`, `platoon`, `p_throws_filter` are pitch-level
     *slicers*: they restrict which first-pitch offspeed pitches contribute to
-    the headline stats, breakdowns, regressions, and per-pitch table. They do
-    NOT change which pitchers are eligible — that's controlled by the
+    the headline stats, breakdowns, and per-pitch table. They do NOT change
+    which pitchers are eligible — that's controlled by the
     pitcher-level gates (`velo_floor`, `min_fastballs`, `min_4seam`,
     `min_offspeed`).
 
@@ -332,17 +209,56 @@ def compute(
     avg_fb_velo = fb_grouped.mean()
     fb_count = fb_grouped.size()
 
-    ff = df[df["pitch_type"] == "FF"]
-    ff_grouped = ff.groupby("pitcher")["pfx_z"]
-    avg_ff_ivb = ff_grouped.mean() * 12
-    ff_count = ff_grouped.size()
+    # Primary fastball per pitcher: whichever of FF / SI they throw more of.
+    # Movement + release traits are computed on *that* pitch only, since a
+    # sinker and a 4-seam have structurally different shapes and averaging
+    # them together would be nonsense for mixed-arsenal guys.
+    ff_ct = df[df["pitch_type"] == "FF"].groupby("pitcher").size()
+    si_ct = df[df["pitch_type"] == "SI"].groupby("pitcher").size()
+    fb_kind_counts = pd.DataFrame({"FF": ff_ct, "SI": si_ct}).fillna(0)
+    primary_fb_kind = fb_kind_counts.idxmax(axis=1).where(
+        fb_kind_counts.sum(axis=1) > 0
+    )
+    pfb_mask = df["pitch_type"] == df["pitcher"].map(primary_fb_kind)
+    pfb = df[pfb_mask]
+    pfb_grouped = pfb.groupby("pitcher")
+    avg_pfb_ivb = pfb_grouped["pfx_z"].mean() * 12
+    avg_pfb_hbreak_signed = pfb_grouped["pfx_x"].mean() * 12
+    avg_pfb_spin = pfb_grouped["release_spin_rate"].mean()
+    avg_pfb_extension = pfb_grouped["release_extension"].mean()
+    avg_pfb_rel_x = pfb_grouped["release_pos_x"].mean()
+    avg_pfb_rel_z = pfb_grouped["release_pos_z"].mean()
 
     is_offspeed_pitch = df["pitch_type"].isin(OFFSPEED_PITCH_TYPES)
-    os_grouped = df[is_offspeed_pitch].groupby("pitcher")["pfx_z"]
-    avg_os_ivb = os_grouped.mean() * 12
+    os_grouped = df[is_offspeed_pitch].groupby("pitcher")
+    avg_os_ivb = os_grouped["pfx_z"].mean() * 12
+    avg_os_hbreak_signed = os_grouped["pfx_x"].mean() * 12
+    avg_os_velo = os_grouped["release_speed"].mean()
+    avg_os_rel_x = os_grouped["release_pos_x"].mean()
+    avg_os_rel_z = os_grouped["release_pos_z"].mean()
     os_count = os_grouped.size()
 
-    avg_vsep = (avg_ff_ivb - avg_os_ivb).dropna()
+    avg_vsep = (avg_pfb_ivb - avg_os_ivb).dropna()
+    avg_hsep = (avg_pfb_hbreak_signed - avg_os_hbreak_signed).abs().dropna()
+    avg_delta_v = (avg_fb_velo - avg_os_velo).dropna()
+    avg_release_sep = (
+        ((avg_pfb_rel_x - avg_os_rel_x) ** 2
+         + (avg_pfb_rel_z - avg_os_rel_z) ** 2) ** 0.5 * 12
+    ).dropna()
+
+    total_pitches_pp = df.groupby("pitcher").size()
+    fb_usage_pct = (fb_count / total_pitches_pp * 100).dropna()
+
+    # Most-common team per pitcher (handles mid-season trades gracefully).
+    if "pitching_team" in df.columns:
+        team_map = (
+            df.dropna(subset=["pitching_team"])
+              .groupby("pitcher")["pitching_team"]
+              .agg(lambda s: s.mode().iat[0] if not s.mode().empty else None)
+              .to_dict()
+        )
+    else:
+        team_map = {}
 
     # 2) Pitcher eligibility (full-data based). Slicers don't move this set.
     elig_mask = fb_count >= min_fastballs
@@ -406,6 +322,9 @@ def compute(
         (pid for pid in eligible_ids if pitches_pp.get(pid, 0) > 0),
         key=lambda p: -avg_fb_velo[p],
     )
+    def _get(series, pid):
+        return float(series[pid]) if pid in series.index and pd.notna(series[pid]) else None
+
     for pid in contributing_ids:
         sw = int(swings_pp.get(pid, 0))
         wh = int(whiffs_pp.get(pid, 0))
@@ -415,16 +334,47 @@ def compute(
             "id": int(pid),
             "name": name_map.get(pid, str(pid)),
             "division": division_map.get(pid),
+            "team": team_map.get(pid),
             "velo": float(avg_fb_velo[pid]),
-            "ivb": float(avg_ff_ivb[pid]) if pid in avg_ff_ivb.index else None,
-            "os_ivb": float(avg_os_ivb[pid]) if pid in avg_os_ivb.index else None,
-            "vsep": float(avg_vsep[pid]) if pid in avg_vsep.index else None,
+            "ivb": _get(avg_pfb_ivb, pid),
+            "os_ivb": _get(avg_os_ivb, pid),
+            "vsep": _get(avg_vsep, pid),
             "fo_pitches": pc,
             "fo_swings": sw,
             "fo_whiffs": wh,
             "fo_called": cs,
             "whiff_rate": round(wh / sw * 100, 1) if sw else None,
             "csw_rate": round((wh + cs) / pc * 100, 1) if pc else None,
+        })
+
+    # Per-pitcher trait table — all FB traits + tunneling/deception
+    # separations + first-pitch OS whiff%. Unlike `per_pitcher`, this is keyed
+    # to the *full* eligible roster (not gated by the filtered slicer) so the
+    # team filter acts on a stable pitcher universe.
+    pitcher_traits = []
+    for pid in sorted(eligible_ids_full, key=lambda p: name_map.get(p, str(p))):
+        sw = int(swings_pp.get(pid, 0))
+        wh = int(whiffs_pp.get(pid, 0))
+        pfb_hbreak = _get(avg_pfb_hbreak_signed, pid)
+        fb_kind = primary_fb_kind.get(pid)
+        pitcher_traits.append({
+            "id": int(pid),
+            "name": name_map.get(pid, str(pid)),
+            "team": team_map.get(pid),
+            "division": division_map.get(pid),
+            "fb_kind": fb_kind if isinstance(fb_kind, str) else None,
+            "fb_velo": float(avg_fb_velo[pid]),
+            "fb_ivb": _get(avg_pfb_ivb, pid),
+            "fb_hbreak": abs(pfb_hbreak) if pfb_hbreak is not None else None,
+            "fb_spin": _get(avg_pfb_spin, pid),
+            "fb_extension": _get(avg_pfb_extension, pid),
+            "fb_usage_pct": _get(fb_usage_pct, pid),
+            "delta_v": _get(avg_delta_v, pid),
+            "vsep": _get(avg_vsep, pid),
+            "hsep": _get(avg_hsep, pid),
+            "release_sep": _get(avg_release_sep, pid),
+            "fo_swings": sw,
+            "whiff_rate": round(wh / sw * 100, 1) if sw else None,
         })
 
     # 8) Headline summary on the filtered + eligible cohort. Counts the
@@ -476,22 +426,8 @@ def compute(
     velo_dict = avg_fb_velo.to_dict()
     vsep_dict = avg_vsep.to_dict()
     pitch_details = _build_pitch_details(
-        fo_eligible, name_map, division_map, velo_dict, vsep_dict
+        fo_eligible, name_map, team_map, velo_dict, vsep_dict
     )
-
-    # 11) Regressions (WLS) on filtered per-pitcher data
-    per_pitcher_df = pd.DataFrame([
-        {
-            "id": p["id"],
-            "velo": p["velo"],
-            "vsep": p["vsep"] if p["vsep"] is not None else np.nan,
-            "whiff_rate": (p["fo_whiffs"] / p["fo_swings"] * 100) if p["fo_swings"] else np.nan,
-            "swings": p["fo_swings"],
-        }
-        for p in per_pitcher
-    ])
-    regression = _run_regression(per_pitcher_df)
-    regression_velo = _run_regression_with_high_velo(per_pitcher_df, velo_cut=95.0)
 
     excluded = [
         {"id": int(pid), "name": name_map.get(pid, str(pid)), "velo": float(velo)}
@@ -515,10 +451,9 @@ def compute(
         },
         "summary": summary,
         "per_pitcher": per_pitcher,
+        "pitcher_traits": pitcher_traits,
         "breakdowns": breakdowns,
         "pitch_details": pitch_details,
-        "regression": regression,
-        "regression_velo": regression_velo,
         "excluded_below_floor": excluded,
     }
 
@@ -550,15 +485,6 @@ def print_summary(divisions=None):
             print(f"  {row['label']:11s}  pitches={st['pitches']:5d}  swings={st['swings']:5d}  "
                   f"whiff%={wr:>6s}  CSW%={csw:>6s}")
         print()
-    print("=== Regressions ===")
-    for tag, reg in (("vsep only", r["regression"]),
-                     ("vsep + high_velo", r["regression_velo"])):
-        if reg.get("skipped_reason"):
-            print(f"{tag}: SKIPPED — {reg['skipped_reason']}")
-            continue
-        print(f"{tag}: n={reg['n']} R²={reg['r_squared']:.3f} ({reg.get('fit_method')})")
-        for c in reg["coefficients"]:
-            print(f"  {c['name']:>10s}  beta={c['coef']:+.3f}  se={c['std_err']:.3f}  p={c['p_value']:.4f}")
     return r
 
 

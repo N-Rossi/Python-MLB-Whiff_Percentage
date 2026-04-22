@@ -3,8 +3,8 @@ Streamlit page for the velo + IVB + CSW%/whiff-rate analysis.
 
 Sidebar drives PITCH-LEVEL slicers (pitch type / location / platoon /
 pitcher handedness / divisions). Velo and VSep are NOT slicers — they're the
-project's X variables, so they appear as columns in the per-pitch table and
-predictors in the regressions, not sliders that move the goalposts.
+project's X variables, so they appear as columns in the per-pitch table, not
+sliders that move the goalposts.
 """
 
 import altair as alt
@@ -44,9 +44,9 @@ if not selected_divs:
 
 st.sidebar.header("Pitch-level slicers")
 st.sidebar.caption(
-    "Filter which **pitches** count toward the headline / breakdowns / "
-    "regressions. Velo and VSep are X-variables — they show up as columns in "
-    "the per-pitch table, not as slicers."
+    "Filter which **pitches** count toward the headline and breakdowns. "
+    "Velo and VSep are X-variables — they show up as columns in the "
+    "per-pitch table, not as slicers."
 )
 
 selected_pitch_types = st.sidebar.multiselect(
@@ -232,7 +232,7 @@ per_pitcher_df = pd.DataFrame([
         "Pitcher": p["name"],
         "Division": p.get("division"),
         "FB velo": p["velo"],
-        "FF IVB": p.get("ivb"),
+        "FB IVB": p.get("ivb"),
         "OS IVB": p.get("os_ivb"),
         "VSep": p.get("vsep"),
         "Whiff rate": p.get("whiff_rate"),
@@ -272,7 +272,7 @@ if not per_pitcher_df.empty:
     y_col = "Whiff rate" if metric_choice == "Whiff %" else "CSW %"
     size_col = "Swings" if metric_choice == "Whiff %" else "Pitches"
 
-    available_x = [c for c in ["FB velo", "FF IVB", "OS IVB", "VSep"]
+    available_x = [c for c in ["FB velo", "FB IVB", "OS IVB", "VSep"]
                    if per_pitcher_df[c].notna().any()]
     x_field = st.selectbox("X axis", available_x, index=0)
 
@@ -299,77 +299,93 @@ if not per_pitcher_df.empty:
         )
 
 
-# --- Regressions ---
-def _stars(p):
-    if p < 0.001: return "***"
-    if p < 0.01:  return "**"
-    if p < 0.05:  return "*"
-    if p < 0.10:  return "."
-    return ""
+# --- Per-pitcher trait table ---
+st.header("Per-pitcher trait table")
+st.caption(
+    "One row per eligible pitcher. FB traits (velo / IVB / arm-side break / "
+    "spin / extension / usage %) plus FB→OS deception separations (ΔV, VSep, "
+    "HSep, release separation). Whiff % here is first-pitch offspeed under the "
+    "current sidebar slicer; the trait columns themselves are season-long and "
+    "do not move with the slicer."
+)
 
-
-def _render_regression(reg, title, caption, f_help):
-    st.header(title)
-    st.caption(caption)
-
-    if reg.get("skipped_reason"):
-        st.warning(reg["skipped_reason"])
-        return
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("N (pitchers)", reg["n"])
-    c2.metric("R²", f"{reg['r_squared']:.3f}")
-    c3.metric("Adj. R²", f"{reg['adj_r_squared']:.3f}")
-    c4.metric("F p-value", f"{reg['f_p_value']:.4f}", help=f_help)
-    if reg.get("fit_method"):
-        st.caption(
-            f"Fit: {reg['fit_method']}"
-            + (f" · total weight = {int(reg['total_weight'])} swings"
-               if reg.get("total_weight") else "")
+traits_df = pd.DataFrame(result.get("pitcher_traits", []))
+if traits_df.empty:
+    st.info("No eligible pitchers under the current velo floor / sample-size gates.")
+else:
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        team_opts = ["All"] + sorted(traits_df["team"].dropna().unique().tolist())
+        team_pick = st.selectbox("Team", team_opts, key="traits_team")
+    with fc2:
+        kind_opts = ["All"] + sorted(traits_df["fb_kind"].dropna().unique().tolist())
+        kind_pick = st.selectbox(
+            "FB kind", kind_opts, key="traits_fb_kind",
+            help="Each pitcher's primary fastball: FF (4-seam) or SI (sinker).",
         )
 
-    coef_df = pd.DataFrame([
-        {
-            "Term": c["label"],
-            "β (pp)": round(c["coef"], 2),
-            "Std err": round(c["std_err"], 2),
-            "t": round(c["t"], 2),
-            "p": round(c["p_value"], 4),
-            "95% CI": f"[{c['ci_lower']:.2f}, {c['ci_upper']:.2f}]",
-            "Sig.": _stars(c["p_value"]),
-        }
-        for c in reg["coefficients"]
-    ])
-    st.subheader("Coefficients")
-    st.dataframe(coef_df, use_container_width=True, hide_index=True)
-    st.caption(
-        "Significance: `***` p<0.001, `**` p<0.01, `*` p<0.05, `.` p<0.10. "
-        "β for `vsep` = pp of whiff% per additional inch of vertical separation."
+    view = traits_df
+    if team_pick != "All":
+        view = view[view["team"] == team_pick]
+    if kind_pick != "All":
+        view = view[view["fb_kind"] == kind_pick]
+
+    rename = {
+        "name": "Pitcher",
+        "team": "Team",
+        "division": "Div",
+        "fb_kind": "FB kind",
+        "fb_velo": "FB velo (mph)",
+        "fb_ivb": "FB IVB (in)",
+        "fb_hbreak": "FB arm-side break (in)",
+        "fb_spin": "FB spin (rpm)",
+        "fb_extension": "FB extension (ft)",
+        "fb_usage_pct": "FB usage %",
+        "delta_v": "ΔV (mph)",
+        "vsep": "VSep (in)",
+        "hsep": "HSep (in)",
+        "release_sep": "Release sep (in)",
+        "fo_swings": "1P-OS swings",
+        "whiff_rate": "1P-OS whiff %",
+    }
+    cols_order = [
+        "Pitcher", "Team", "Div", "FB kind",
+        "FB velo (mph)", "FB IVB (in)", "FB arm-side break (in)",
+        "FB spin (rpm)", "FB extension (ft)", "FB usage %",
+        "ΔV (mph)", "VSep (in)", "HSep (in)", "Release sep (in)",
+        "1P-OS swings", "1P-OS whiff %",
+    ]
+    traits_view = (
+        view.drop(columns=["id"], errors="ignore")
+            .rename(columns=rename)
+            .reindex(columns=cols_order)
     )
 
+    for col, nd in (
+        ("FB velo (mph)", 1), ("FB IVB (in)", 1), ("FB arm-side break (in)", 1),
+        ("FB spin (rpm)", 0), ("FB extension (ft)", 2), ("FB usage %", 1),
+        ("ΔV (mph)", 1), ("VSep (in)", 1), ("HSep (in)", 1), ("Release sep (in)", 2),
+    ):
+        traits_view[col] = pd.to_numeric(traits_view[col], errors="coerce").round(nd)
 
-_render_regression(
-    result["regression"],
-    title="Regression 1: whiff% ~ vsep (pitcher-level, WLS)",
-    caption=(
-        "Weighted LS, Y = per-pitcher first-pitch offspeed whiff% under the "
-        "current slicer. X of interest: `vsep` (continuous, inches). "
-        "Each pitcher weighted by their qualifying swing count."
-    ),
-    f_help="Test that the vsep slope is zero.",
-)
-
-_velo_cut = result["regression_velo"].get("velo_cut", 95.0)
-_render_regression(
-    result["regression_velo"],
-    title=f"Regression 2: whiff% ~ vsep + high_velo (FB ≥ {_velo_cut} mph), pitcher-level WLS",
-    caption=(
-        f"Weighted LS, Y = whiff% under current slicer. X: `vsep` + "
-        f"`high_velo` (1 if avg FB ≥ {_velo_cut} mph, else 0). Adds high-velo "
-        f"as a control on top of Regression 1."
-    ),
-    f_help="Joint test that both slope coefficients (vsep, high_velo) are zero.",
-)
+    traits_view = traits_view.sort_values("1P-OS whiff %", ascending=False, na_position="last")
+    st.dataframe(traits_view, use_container_width=True, hide_index=True)
+    active_filters = []
+    if team_pick != "All":
+        active_filters.append(f"team `{team_pick}`")
+    if kind_pick != "All":
+        active_filters.append(f"FB kind `{kind_pick}`")
+    filter_note = (
+        "" if not active_filters else f" Filtered to {', '.join(active_filters)}."
+    )
+    st.caption(
+        f"{len(traits_view):,} pitchers shown.{filter_note}"
+        "  `FB kind` is each pitcher's primary fastball (FF or SI, whichever "
+        "they throw more of). All FB movement / release traits are computed on "
+        "that pitch only. ΔV = FB velo − OS velo. VSep/HSep = |FB − OS| "
+        "induced break. Release sep = euclidean distance between avg FB and "
+        "OS release points."
+    )
 
 
 # --- Per-pitch detail ---
@@ -387,7 +403,7 @@ if pitch_details_df.empty:
 else:
     rename = {
         "pitcher": "Pitcher",
-        "division": "Div",
+        "team": "Team",
         "game_date": "Date",
         "velo": "Velo (mph)",
         "vsep": "VSep (in)",
@@ -402,7 +418,7 @@ else:
         "called_strike": "Called strike",
     }
     cols_order = [
-        "Pitcher", "Div", "Date", "Velo (mph)", "VSep (in)",
+        "Pitcher", "Team", "Date", "Velo (mph)", "VSep (in)",
         "Pitch type", "P-hand", "B-stand",
         "Same hand", "In zone", "Description",
         "Swing", "Whiff", "Called strike",
@@ -415,12 +431,12 @@ else:
     display_df["Velo (mph)"] = pd.to_numeric(display_df["Velo (mph)"], errors="coerce").round(1)
     display_df["VSep (in)"] = pd.to_numeric(display_df["VSep (in)"], errors="coerce").round(1)
 
-    def _apply_filters(df, pitcher=None, div=None, ptype=None, matchup=None):
+    def _apply_filters(df, pitcher=None, team=None, ptype=None, matchup=None):
         out = df
         if pitcher and pitcher != "All":
             out = out[out["Pitcher"] == pitcher]
-        if div and div != "All":
-            out = out[out["Div"] == div]
+        if team and team != "All":
+            out = out[out["Team"] == team]
         if ptype and ptype != "All":
             out = out[out["Pitch type"] == ptype]
         if matchup and matchup != "All":
@@ -432,34 +448,34 @@ else:
         pairs = df[["P-hand", "B-stand"]].dropna().drop_duplicates()
         return sorted(f"{p}/{b}" for p, b in pairs.itertuples(index=False))
 
-    for _k in ("filter_pitcher", "filter_div", "filter_ptype", "filter_matchup"):
+    for _k in ("filter_pitcher", "filter_team", "filter_ptype", "filter_matchup"):
         st.session_state.setdefault(_k, "All")
 
     pitcher_pick = st.session_state["filter_pitcher"]
-    div_pick = st.session_state["filter_div"]
+    team_pick = st.session_state["filter_team"]
     ptype_pick = st.session_state["filter_ptype"]
     matchup_pick = st.session_state["filter_matchup"]
 
     pitcher_opts = ["All"] + sorted(
-        _apply_filters(display_df, div=div_pick, ptype=ptype_pick, matchup=matchup_pick)
+        _apply_filters(display_df, team=team_pick, ptype=ptype_pick, matchup=matchup_pick)
         ["Pitcher"].dropna().unique().tolist()
     )
-    div_opts = ["All"] + sorted(
+    team_opts = ["All"] + sorted(
         _apply_filters(display_df, pitcher=pitcher_pick, ptype=ptype_pick, matchup=matchup_pick)
-        ["Div"].dropna().unique().tolist()
+        ["Team"].dropna().unique().tolist()
     )
     ptype_opts = ["All"] + sorted(
-        _apply_filters(display_df, pitcher=pitcher_pick, div=div_pick, matchup=matchup_pick)
+        _apply_filters(display_df, pitcher=pitcher_pick, team=team_pick, matchup=matchup_pick)
         ["Pitch type"].dropna().unique().tolist()
     )
     matchup_opts = ["All"] + _matchup_opts(
-        _apply_filters(display_df, pitcher=pitcher_pick, div=div_pick, ptype=ptype_pick)
+        _apply_filters(display_df, pitcher=pitcher_pick, team=team_pick, ptype=ptype_pick)
     )
 
     if pitcher_pick not in pitcher_opts:
         st.session_state["filter_pitcher"] = "All"
-    if div_pick not in div_opts:
-        st.session_state["filter_div"] = "All"
+    if team_pick not in team_opts:
+        st.session_state["filter_team"] = "All"
     if ptype_pick not in ptype_opts:
         st.session_state["filter_ptype"] = "All"
     if matchup_pick not in matchup_opts:
@@ -467,7 +483,7 @@ else:
 
     fc1, fc2, fc3, fc4 = st.columns(4)
     with fc1:
-        div_pick = st.selectbox("Division", div_opts, key="filter_div")
+        team_pick = st.selectbox("Team", team_opts, key="filter_team")
     with fc2:
         pitcher_pick = st.selectbox("Pitcher", pitcher_opts, key="filter_pitcher")
     with fc3:
@@ -490,7 +506,7 @@ else:
         st.caption(f"Pitch type key — {key_str}")
 
     display_df = _apply_filters(
-        display_df, pitcher=pitcher_pick, div=div_pick, ptype=ptype_pick, matchup=matchup_pick
+        display_df, pitcher=pitcher_pick, team=team_pick, ptype=ptype_pick, matchup=matchup_pick
     )
     display_df = display_df.sort_values(["Pitcher", "Date"], na_position="last")
     st.dataframe(display_df, use_container_width=True, hide_index=True)
