@@ -123,24 +123,32 @@ export default function FirstPitchOffspeed() {
 
   if (bootError) {
     return (
-      <div className="error">
-        Failed to load metadata: {bootError}
-        <br />
-        Is the backend running? Start it with{" "}
-        <code>uvicorn backend.main:app --reload --port 8000</code>
+      <div className="legacy-page">
+        <div className="error">
+          Failed to load metadata: {bootError}
+          <br />
+          Is the backend running? Start it with{" "}
+          <code>uvicorn backend.main:app --reload --port 8000</code>
+        </div>
       </div>
     );
   }
   if (!meta || !state || hasData == null) {
-    return <div className="loading">Loading…</div>;
+    return (
+      <div className="legacy-page">
+        <div className="loading">Loading…</div>
+      </div>
+    );
   }
   if (!hasData) {
     return (
-      <div className="error">
-        No pitch data found in <code>data/</code>.
-        <br />
-        Run <code>python fetch_starters.py &lt;division&gt;</code> first to
-        populate the cache. Use <code>all</code> to fetch every division.
+      <div className="legacy-page">
+        <div className="error">
+          No pitch data found in <code>data/</code>.
+          <br />
+          Run <code>python fetch_starters.py &lt;division&gt;</code> first to
+          populate the cache. Use <code>all</code> to fetch every division.
+        </div>
       </div>
     );
   }
@@ -170,6 +178,7 @@ export default function FirstPitchOffspeed() {
     .filter((v) => v != null);
 
   return (
+    <div className="legacy-page">
     <div className="layout">
       <Sidebar state={state} setState={setState} meta={meta} />
 
@@ -371,6 +380,7 @@ export default function FirstPitchOffspeed() {
 
         {loading && !result && <div className="loading">Computing…</div>}
       </div>
+    </div>
     </div>
   );
 }
