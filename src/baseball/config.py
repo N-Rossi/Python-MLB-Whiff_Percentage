@@ -14,6 +14,13 @@ PARQUET_COMPRESSION = "zstd"
 REGULAR_SEASON_START_MMDD = "03-01"
 REGULAR_SEASON_END_MMDD = "11-30"
 
+# Empirical-Bayes prior strength for rate shrinkage in derived tables.
+# `k` is the sample size at which raw and prior contribute 50/50.
+# See SAMPLE_SIZES.md for per-metric motivation.
+SHRINKAGE_K: dict[str, int] = {
+    "pitch_mix": 20,
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(

@@ -48,7 +48,17 @@ def rebuild_derived(
     table: str | None = typer.Option(None, "--table", help="Rebuild only this table"),
 ) -> None:
     """Rebuild derived Parquet tables from raw pitch data."""
-    raise NotImplementedError
+    from baseball.jobs.rebuild_derived import REGISTRY, rebuild_all, rebuild_one
+
+    if table:
+        if table not in REGISTRY:
+            typer.echo(
+                f"Unknown table {table!r}. Available: {sorted(REGISTRY)}", err=True
+            )
+            raise typer.Exit(code=1)
+        rebuild_one(table)
+    else:
+        rebuild_all()
 
 
 _DIAGNOSTIC_NULL_COLUMNS = (
