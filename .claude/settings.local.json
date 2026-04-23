@@ -37,7 +37,8 @@
       "Bash(curl -s http://localhost:5173/)",
       "Bash(curl -s http://localhost:5173/src/App.jsx)",
       "Read(//tmp/**)",
-      "Bash(wait echo *)"
+      "Bash(wait echo *)",
+      "Bash(npm install *)"
     ]
   }
 }
