@@ -50,11 +50,37 @@ def available_divisions():
     return sorted(set(divs))
 
 
+_PITCH_CACHE = {}  # (path, mtime_ns) -> DataFrame (one entry per file)
+_CONCAT_CACHE = {}  # (frozenset(paths+mtimes), divisions) -> concatenated DataFrame
+
+
+def _load_one(path):
+    """Read one parquet file, cached by (path, mtime). The Parquet read is the
+    slow part, so the cache bypasses it on every subsequent request."""
+    m = _DIVISION_FROM_FILENAME.match(path.name)
+    div = m.group(1) if m else path.stem
+    key = (str(path), path.stat().st_mtime_ns)
+    hit = _PITCH_CACHE.get(key)
+    if hit is not None:
+        return div, hit
+    df = pd.read_parquet(path)
+    if "division" not in df.columns:
+        df["division"] = div
+    _PITCH_CACHE[key] = df
+    # Drop any older cache entries for the same file (different mtime).
+    stale = [k for k in _PITCH_CACHE if k[0] == str(path) and k != key]
+    for k in stale:
+        _PITCH_CACHE.pop(k, None)
+    return div, df
+
+
 def load_pitches(divisions=None):
     """
     Load and concat every {division}_starters_*_pitches.parquet in the data
     dir. If `divisions` is given, restrict to those. Adds/repairs the
     `division` column from the filename for older files that predate it.
+
+    Cached in memory per file — first call is slow, subsequent calls are fast.
     """
     paths = sorted(DATA_DIR.glob(PITCHES_GLOB))
     if not paths:
@@ -63,15 +89,20 @@ def load_pitches(divisions=None):
             f"Run `python fetch_starters.py <division>` first."
         )
 
+    file_fingerprint = frozenset(
+        (str(p), p.stat().st_mtime_ns) for p in paths
+    )
+    divs_key = frozenset(divisions) if divisions else None
+    cache_key = (file_fingerprint, divs_key)
+    hit = _CONCAT_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+
     frames = []
     for path in paths:
-        m = _DIVISION_FROM_FILENAME.match(path.name)
-        div = m.group(1) if m else path.stem
+        div, df = _load_one(path)
         if divisions and div not in divisions:
             continue
-        df = pd.read_parquet(path)
-        if "division" not in df.columns:
-            df["division"] = div
         frames.append(df)
 
     if not frames:
@@ -79,7 +110,10 @@ def load_pitches(divisions=None):
             f"No pitch parquet files matched divisions={divisions}. "
             f"Available: {available_divisions()}"
         )
-    return pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True)
+    _CONCAT_CACHE.clear()  # bound memory: only keep the most recent cut
+    _CONCAT_CACHE[cache_key] = combined
+    return combined
 
 
 def _pitch_stats(d):
@@ -121,44 +155,36 @@ OFFSPEED_PITCH_TYPES = tuple(PITCH_TYPE_LABELS.keys())
 def _build_pitch_details(d, name_map, team_map, velo_dict, vsep_dict):
     """
     One row per first-pitch offspeed pitch (already filtered by the caller).
-    Assumes `d` already has `in_zone` and `same_hand` cols. Adds the pitcher's
-    avg FB velo and VSep so each row carries those X-vars alongside the
-    pitch-level slicer columns.
+    Vectorized: build all output columns, then `to_dict('records')` once.
     """
     if d.empty:
         return []
-
-    d = d.copy()
-    d["swing"] = d["description"].isin(SWING_DESCRIPTIONS).astype(int)
-    d["whiff"] = d["description"].str.startswith("swinging_strike").astype(int)
-    d["called_strike"] = (d["description"] == CALLED_STRIKE_DESCRIPTION).astype(int)
 
     sort_cols = [c for c in ("pitcher", "game_date", "at_bat_number") if c in d.columns]
     if sort_cols:
         d = d.sort_values(sort_cols)
 
-    rows = []
-    for r in d.itertuples(index=False):
-        rd = r._asdict()
-        pid = rd["pitcher"]
-        rows.append({
-            "pitcher_id": int(pid),
-            "pitcher": name_map.get(pid, str(pid)),
-            "team": team_map.get(pid),
-            "game_date": str(rd.get("game_date")) if rd.get("game_date") is not None else None,
-            "velo": float(velo_dict[pid]) if pid in velo_dict else None,
-            "vsep": float(vsep_dict[pid]) if pid in vsep_dict else None,
-            "pitch_type": rd.get("pitch_type"),
-            "p_throws": rd.get("p_throws"),
-            "stand": rd.get("stand"),
-            "in_zone": int(rd["in_zone"]) if pd.notna(rd["in_zone"]) else None,
-            "same_hand": int(rd["same_hand"]) if pd.notna(rd["same_hand"]) else None,
-            "description": rd.get("description"),
-            "swing": int(rd["swing"]),
-            "whiff": int(rd["whiff"]),
-            "called_strike": int(rd["called_strike"]),
-        })
-    return rows
+    pid = d["pitcher"]
+    desc = d["description"]
+    out = pd.DataFrame({
+        "pitcher_id": pid.astype("int64"),
+        "pitcher": pid.map(name_map).fillna(pid.astype(str)),
+        "team": pid.map(team_map),
+        "game_date": d["game_date"].astype(str) if "game_date" in d.columns else None,
+        "velo": pid.map(velo_dict).astype("Float64"),
+        "vsep": pid.map(vsep_dict).astype("Float64"),
+        "pitch_type": d["pitch_type"],
+        "p_throws": d["p_throws"],
+        "stand": d["stand"],
+        "in_zone": d["in_zone"],
+        "same_hand": d["same_hand"],
+        "description": desc,
+        "swing": desc.isin(SWING_DESCRIPTIONS).astype("int8"),
+        "whiff": desc.str.startswith("swinging_strike").fillna(False).astype("int8"),
+        "called_strike": (desc == CALLED_STRIKE_DESCRIPTION).astype("int8"),
+    })
+    # None-out NaN so the JSON payload carries null, not the string "nan".
+    return out.astype(object).where(out.notna(), None).to_dict(orient="records")
 
 
 # Slicer option constants — UI choices map to these values.
