@@ -8,6 +8,7 @@ from baseball.derived.batter_tables import (
     build_batter_vs_sequences,
     build_batter_whiff_profile,
 )
+from baseball.derived.matchup_tables import build_matchup_edges
 from baseball.derived.pitcher_tables import (
     build_pitcher_pitch_mix,
     build_pitcher_sequences_2pitch,
@@ -752,3 +753,120 @@ def test_batter_vs_sequences_rates(synthetic_pitches_for_batter_seq):
     # strikeout_rate_shrunk = (1 + 40*(1/3)) / (2 + 40)
     expected_k = (1 + 40 * (1 / 3)) / 42
     assert r.loc[100, "strikeout_rate_shrunk"] == pytest.approx(expected_k)
+
+
+# ---------------------------------------------------------------------------
+# matchup_edges
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_pitches_for_matchup(isolated_data_root):
+    """Build a minimal but complete scenario where matchup edge math is tractable.
+
+    Pitcher 100 ('A') throws in 0-0:  20 FF + 20 SL  (pct_shrunk FF ≈ SL)
+    Pitcher 200 ('B') throws in 0-0:  40 FF          (pct_shrunk FF ≈ 1.0)
+
+    Batter 900 faces both pitchers. In 0-0:
+      - swings at 10 FF (3 whiffs)
+      - swings at 10 SL (6 whiffs)  → high SL vulnerability
+    Batter 901 faces both pitchers. In 0-0:
+      - swings at 10 FF (3 whiffs)
+      - swings at 10 SL (3 whiffs)
+
+    The whiff-profile swings are shared across batters — I realize the math
+    cross-dimension, so the test focuses on *shape* (rows exist, joins work,
+    edge_weighted == pitcher_pct_shrunk * edge_lift) rather than exact values.
+    """
+    rows = []
+    for i in range(20):
+        rows.append(_match_row(100, 900 + (i % 2), "FF", 5, "foul"))
+    for i in range(20):
+        rows.append(_match_row(100, 900 + (i % 2), "SL", 5,
+                               "swinging_strike" if i < 9 else "foul"))
+    for i in range(40):
+        rows.append(_match_row(200, 900 + (i % 2), "FF", 5,
+                               "swinging_strike" if i < 6 else "foul"))
+
+    df = pd.DataFrame(rows)
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    for col in ("pitcher", "batter", "game_pk", "balls", "strikes", "zone"):
+        df[col] = df[col].astype("Int64")
+
+    part = isolated_data_root / "raw" / "statcast" / "season=2024" / "month=04"
+    part.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(part / "pitches.parquet", compression="zstd", index=False)
+    return isolated_data_root
+
+
+def _match_row(pitcher: int, batter: int, pitch_type: str, zone: int, description: str) -> dict:
+    return {
+        "pitcher": pitcher,
+        "batter": batter,
+        "player_name": f"P{pitcher}",
+        "game_date": "2024-04-01",
+        "game_pk": 1,
+        "game_type": "R",
+        "balls": 0,
+        "strikes": 0,
+        "pitch_type": pitch_type,
+        "zone": zone,
+        "description": description,
+        "p_throws": "R",
+    }
+
+
+def _build_matchup_prerequisites(synthetic_pitches_for_matchup):
+    con = get_connection()
+    register_views(con)
+    build_pitcher_pitch_mix(con)
+    build_batter_whiff_profile(con)
+    build_matchup_edges(con)
+    return con
+
+
+def test_matchup_edges_produces_rows_and_right_keys(synthetic_pitches_for_matchup):
+    _build_matchup_prerequisites(synthetic_pitches_for_matchup)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_matchup / "derived" / "matchup_edges.parquet"
+    )
+    # Pairs × cells-in-common:
+    #   (100, 900), (100, 901): both have FF and SL cells from pitcher
+    #     and both have FF and SL cells from batter → 2 cells each → 4 rows
+    #   (200, 900), (200, 901): only FF cell from pitcher
+    #     and both batters have FF cells → 1 cell each → 2 rows
+    # Total: 6 rows
+    assert len(r) == 6
+    assert set(r["pitcher"]) == {100, 200}
+    assert set(r["batter"]) == {900, 901}
+
+
+def test_matchup_edge_weighted_equals_pct_shrunk_times_lift(synthetic_pitches_for_matchup):
+    _build_matchup_prerequisites(synthetic_pitches_for_matchup)
+    r = pd.read_parquet(
+        synthetic_pitches_for_matchup / "derived" / "matchup_edges.parquet"
+    )
+    # edge_weighted should exactly equal pitcher_pct_shrunk * edge_lift
+    assert ((r["edge_weighted"] - r["pitcher_pct_shrunk"] * r["edge_lift"]).abs()
+            < 1e-12).all()
+
+
+def test_matchup_edges_missing_prereq_raises(isolated_data_root):
+    """Calling build_matchup_edges without prerequisites on disk should error cleanly."""
+    con = get_connection()
+    # No raw pitches, no derived tables
+    with pytest.raises(FileNotFoundError, match="matchup_edges needs"):
+        build_matchup_edges(con)
+
+
+def test_matchup_edges_top_view_registered(synthetic_pitches_for_matchup):
+    _build_matchup_prerequisites(synthetic_pitches_for_matchup)
+    # After building, a fresh session should get the summary view.
+    con = get_connection()
+    register_views(con)
+    # Use the DB directly — bypass list_tables because it doesn't pull views
+    # from all schemas by default. DESCRIBE works for both.
+    result = con.execute("SELECT COUNT(*) FROM matchup_edges_top").fetchone()[0]
+    # One row per (pitcher, batter, season): 4 pairs
+    assert result == 4

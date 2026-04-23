@@ -33,9 +33,14 @@ def write_derived_parquet(
         (FORMAT PARQUET, COMPRESSION {PARQUET_COMPRESSION.upper()})
         """
     )
-    rows = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{out_path.as_posix()}')"
-    ).fetchone()[0]
+    # Re-register the view pointing at the fresh file so subsequent builds in
+    # the same session (e.g. matchup_edges depends on pitcher_pitch_mix) can
+    # still reference it by name.
+    con.execute(
+        f"CREATE OR REPLACE VIEW {table_name} AS "
+        f"SELECT * FROM read_parquet('{out_path.as_posix()}')"
+    )
+    rows = con.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
     size_mb = out_path.stat().st_size / 1024 / 1024
     logger.info(f"Wrote {table_name}: {rows:,} rows, {size_mb:.2f} MB → {out_path}")
     return out_path

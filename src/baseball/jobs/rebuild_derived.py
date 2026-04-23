@@ -12,6 +12,7 @@ from baseball.derived.batter_tables import (
     build_batter_vs_sequences,
     build_batter_whiff_profile,
 )
+from baseball.derived.matchup_tables import build_matchup_edges
 from baseball.derived.pitcher_tables import (
     build_pitcher_pitch_mix,
     build_pitcher_sequences_2pitch,
@@ -19,8 +20,8 @@ from baseball.derived.pitcher_tables import (
 )
 from baseball.storage.duckdb_conn import get_connection, register_views
 
-# Order matters once tables start depending on one another (e.g., matchup_edges
-# joins pitcher and batter tables). The current tables are independent.
+# Insertion order is the build order. matchup_edges reads from pitcher_pitch_mix
+# and batter_whiff_profile, so those must come earlier.
 REGISTRY: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "pitcher_pitch_mix": build_pitcher_pitch_mix,
     "pitcher_zone_tendency": build_pitcher_zone_tendency,
@@ -28,6 +29,7 @@ REGISTRY: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "batter_whiff_profile": build_batter_whiff_profile,
     "batter_swing_decisions": build_batter_swing_decisions,
     "batter_vs_sequences": build_batter_vs_sequences,
+    "matchup_edges": build_matchup_edges,
 }
 
 

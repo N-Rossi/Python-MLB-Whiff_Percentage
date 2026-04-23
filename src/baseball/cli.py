@@ -61,6 +61,18 @@ def rebuild_derived(
         rebuild_all()
 
 
+@app.command("daily-update")
+def daily_update(
+    days: int = typer.Option(1, "--days", help="How many trailing days to ingest (1 = yesterday only)"),
+    skip_rebuild: bool = typer.Option(False, "--skip-rebuild", help="Ingest only; leave derived tables alone"),
+    force: bool = typer.Option(False, "--force", help="Re-pull even if a day is already cached"),
+) -> None:
+    """Cron entrypoint: ingest the last N days and rebuild derived tables."""
+    from baseball.jobs.daily_update import run
+
+    raise typer.Exit(code=run(days=days, skip_rebuild=skip_rebuild, force=force))
+
+
 _DIAGNOSTIC_NULL_COLUMNS = (
     "pitch_type",
     "release_speed",

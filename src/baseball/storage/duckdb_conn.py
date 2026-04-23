@@ -68,12 +68,29 @@ def _register_derived_views(con: duckdb.DuckDBPyConnection) -> list[str]:
     return registered
 
 
+def _register_special_views(con: duckdb.DuckDBPyConnection, derived: list[str]) -> list[str]:
+    """Register convenience views that depend on specific derived tables.
+
+    `matchup_edges_top` is a wide per-(pitcher, batter) roll-up of the long
+    `matchup_edges` table. Only registered if matchup_edges itself exists.
+    """
+    special: list[str] = []
+    if "matchup_edges" in derived:
+        from baseball.derived.matchup_tables import MATCHUP_EDGES_TOP_SQL
+
+        con.execute(MATCHUP_EDGES_TOP_SQL)
+        special.append("matchup_edges_top")
+    return special
+
+
 def register_views(con: duckdb.DuckDBPyConnection) -> dict[str, object]:
     """Register every queryable view: `pitches` over raw partitions, plus one
-    view per `data/derived/*.parquet` file named after its stem."""
+    view per `data/derived/*.parquet` file named after its stem, plus any
+    convenience views built on top of those (e.g. `matchup_edges_top`)."""
     has_pitches = _register_pitches_view(con)
     derived = _register_derived_views(con)
-    return {"pitches": has_pitches, "derived": derived}
+    special = _register_special_views(con, derived)
+    return {"pitches": has_pitches, "derived": derived, "special": special}
 
 
 def list_tables(con: duckdb.DuckDBPyConnection) -> list[str]:

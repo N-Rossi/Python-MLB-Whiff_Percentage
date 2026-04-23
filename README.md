@@ -2,20 +2,27 @@
 
 Data infrastructure and analytics for MLB pitch-sequencing and pitcher/batter matchup edges. The repo has three parts:
 
-1. **`src/baseball/`** — the main data pipeline (ingest Statcast → Parquet → DuckDB → derived tables). This is the active build-out.
+1. **`src/baseball/`** — the main data pipeline (ingest Statcast → Parquet → DuckDB → derived tables). Phase 1 complete.
 2. **`reports/`** — a blog-style archive of standalone one-off analyses. Each report is self-contained and deliberately kept separate from the main pipeline.
 3. **`backend/` + `frontend/`** — a legacy FastAPI + React web app that surfaces the first-pitch offspeed report. Will eventually be rewired on top of the new data pipeline; for now it runs against frozen data in `data/legacy/`.
+
+**Documentation:**
+- **[TABLES.md](TABLES.md)** — plain-English explanation of every table and column (start here if you're new).
+- **[SAMPLE_SIZES.md](SAMPLE_SIZES.md)** — minimum-sample conventions and empirical-Bayes shrinkage approach.
+- **[deploy/README.md](deploy/README.md)** — VM deployment: cron / systemd timer setup.
 
 ## Status
 
 | Component | State |
 |---|---|
-| `baseball backfill` (ingest historical Statcast) | ✅ works |
-| `baseball update` (nightly in-season pull) | ✅ works |
-| `baseball rebuild-derived` | ✅ works (3 pitcher + 3 batter tables; `matchup_edges` pending) |
+| `baseball backfill` (one-time historical ingest) | ✅ works |
+| `baseball update` (single-day ingest) | ✅ works |
+| `baseball daily-update` (cron entrypoint: ingest + rebuild) | ✅ works |
+| `baseball rebuild-derived` | ✅ works — all 7 derived tables |
 | `baseball inspect` | ✅ works |
 | `baseball query` | ✅ works |
 | `baseball shell` (interactive SQL) | ✅ works |
+| Nightly cron deployment (systemd / crontab) | ✅ templates ready in `deploy/` |
 | Legacy FastAPI + React app | ✅ runs against `data/legacy/` |
 
 ## Requirements
@@ -65,7 +72,14 @@ baseball update                      # defaults to yesterday
 
 # Force re-pull even if the week is already cached
 baseball backfill --start-season 2024 --end-season 2024 --force
+
+# Full nightly cron cycle: ingest last N days + rebuild derived tables
+baseball daily-update                # yesterday only
+baseball daily-update --days 3       # catch up last 3 days
+baseball daily-update --skip-rebuild # ingest only
 ```
+
+The difference between `update` and `daily-update`: `update` pulls one day and stops. `daily-update` is the full cron cycle — it pulls the last N days, then rebuilds all derived tables so `matchup_edges` and the `_shrunk` columns reflect the fresh data. See **[deploy/README.md](deploy/README.md)** for VM deployment.
 
 **Idempotency.** A sidecar `.manifest.json` at `data/raw/statcast/.manifest.json` tracks completed weeks. Re-running any command skips weeks that are already on disk. The cache is self-healing — if you delete a Parquet partition, the next run detects the missing file and re-pulls. Use `--force` to bypass the cache entirely.
 
@@ -92,7 +106,7 @@ data/
 │   ├── batter_whiff_profile.parquet           # ✅ built
 │   ├── batter_swing_decisions.parquet         # ✅ built
 │   ├── batter_vs_sequences.parquet            # ✅ built
-│   └── matchup_edges.parquet                  # 🚧 pending
+│   └── matchup_edges.parquet                  # ✅ built (+ `matchup_edges_top` view)
 └── legacy/                             # frozen data for the legacy report
     └── *_starters_2025_*.parquet
 ```
@@ -214,7 +228,28 @@ Every rate column ships in three flavors:
 
 Every table also carries an explicit sample-size column (`pitch_count`, `zone_count`, `swings`, `n_sequences`, etc.) so consumers apply their own minimum thresholds. See `SAMPLE_SIZES.md` for recommended cutoffs.
 
-The cross-joined `matchup_edges` table (pitcher tendency × batter vulnerability) is coming next.
+**Matchup table:**
+
+| Table | Key | Rows (2024) | What it answers |
+|---|---|---|---|
+| `matchup_edges` | `(pitcher, batter, season, pitch_type, balls, strikes)` | 3.85M | For every (pitcher, batter) pair that actually met: where's the leverage? |
+
+Per-row columns include both sides' sample sizes, the batter's shrunk whiff rate, the league baseline, and two edge metrics:
+
+- **`edge_lift`** = `batter_whiff_shrunk - league_whiff_rate` — the batter's excess vulnerability (independent of pitcher).
+- **`edge_weighted`** = `pitcher_pct_shrunk × edge_lift` — leverage weighted by the pitcher actually throwing that pitch.
+
+A convenience view **`matchup_edges_top`** is auto-registered alongside and rolls up to one row per `(pitcher, batter, season)` with the top-3 edges surfaced as columns. Good for building pairwise-matchup UIs without the frontend needing to aggregate.
+
+```sql
+-- Which pitches does Skubal hunt Juan Soto with?
+SELECT pitch_type, balls, strikes, pitcher_n, batter_swings,
+       ROUND(edge_lift*100, 1) AS lift_pp,
+       ROUND(edge_weighted*1000, 1) AS weighted_x1000
+FROM matchup_edges
+WHERE player_name = 'Skubal, Tarik' AND batter = 665742
+ORDER BY edge_weighted DESC LIMIT 5;
+```
 
 ### DuckDB for Postgres users
 
@@ -319,7 +354,31 @@ All settings live in `.env` (copy from `.env.example`):
 
 ### Sample-size conventions
 
-See **`SAMPLE_SIZES.md`** for the minimum-sample thresholds and empirical-Bayes shrinkage approach used by derived tables. The short version: we store every sample in derived tables without filtering, and thresholds / shrinkage are applied at query time.
+See **[SAMPLE_SIZES.md](SAMPLE_SIZES.md)** for the minimum-sample thresholds and empirical-Bayes shrinkage approach used by derived tables. The short version: we store every sample in derived tables without filtering, and thresholds / shrinkage are applied at query time.
+
+## Deployment (nightly cron on a VM)
+
+The full cycle — **ingest yesterday + rebuild derived tables** — is wrapped up in `baseball daily-update`. Templates for both **systemd timer** (recommended, DST-aware) and **crontab** (simpler, UTC only) live in the `deploy/` directory.
+
+Quickstart on a fresh Linux VM:
+
+```bash
+git clone <repo-url> /opt/baseball
+cd /opt/baseball
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements.txt && .venv/bin/pip install -e .
+.venv/bin/baseball backfill --start-season 2015 --end-season $(date +%Y)
+.venv/bin/baseball rebuild-derived
+
+# Systemd timer (recommended)
+sudo useradd --system --create-home --shell /usr/sbin/nologin baseball
+sudo mkdir -p /var/log/baseball
+sudo chown -R baseball:baseball /opt/baseball /var/log/baseball
+sudo cp deploy/systemd/baseball-daily-update.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now baseball-daily-update.timer
+```
+
+See **[deploy/README.md](deploy/README.md)** for the full walkthrough, crontab alternative, troubleshooting, and environment-variable knobs (memory cap, log directory).
 
 ## Project structure
 
@@ -335,9 +394,18 @@ src/baseball/
 ├── derived/
 │   ├── _common.py          # shared helper: write_derived_parquet
 │   ├── pitcher_tables.py   # pitch_mix, zone_tendency, sequences_2pitch
-│   └── batter_tables.py    # whiff_profile, swing_decisions, vs_sequences
+│   ├── batter_tables.py    # whiff_profile, swing_decisions, vs_sequences
+│   └── matchup_tables.py   # matchup_edges + matchup_edges_top view
 └── jobs/
-    └── rebuild_derived.py  # REGISTRY + rebuild orchestrator
+    ├── rebuild_derived.py  # REGISTRY + rebuild orchestrator
+    └── daily_update.py     # cron entrypoint: ingest + rebuild
+
+deploy/                     # systemd unit + crontab templates for VM install
+├── README.md
+├── crontab.example
+└── systemd/
+    ├── baseball-daily-update.service
+    └── baseball-daily-update.timer
 
 reports/                    # standalone analyses (see Reports section)
 backend/                    # legacy FastAPI

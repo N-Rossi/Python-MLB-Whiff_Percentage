@@ -1,0 +1,18 @@
+[Unit]
+Description=Run baseball daily update at 08:00 America/New_York
+Requires=baseball-daily-update.service
+
+[Timer]
+# 08:00 ET year-round — systemd handles DST automatically with this TZ form.
+OnCalendar=*-*-* 08:00:00 America/New_York
+
+# If the VM was offline at the scheduled time, run once on boot to catch up.
+Persistent=true
+
+# Small jitter so we don't hammer Savant at exactly :00.
+RandomizedDelaySec=300
+
+Unit=baseball-daily-update.service
+
+[Install]
+WantedBy=timers.target

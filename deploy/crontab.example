@@ -1,0 +1,20 @@
+# Example crontab for the nightly Statcast update.
+#
+# Install with:   crontab deploy/crontab.example
+# Inspect with:   crontab -l
+#
+# Timing: Baseball Savant typically has previous-day data settled by ~06:00 ET.
+# Running at 12:00 UTC (~08:00 ET during EDT, ~07:00 during EST) is a safe bet.
+# If you want to follow New York time exactly, use systemd timers instead (see
+# deploy/systemd/) — cron can't do timezone-aware scheduling cleanly.
+#
+# --days 2 gives a one-day catch-up cushion if a prior run failed. Subsequent
+# runs skip already-cached days in <1s thanks to the manifest.
+#
+# Adjust the paths to match your install (defaults assume /opt/baseball).
+
+# m h dom mon dow  command
+MAILTO=you@example.com
+BASEBALL_DAILY_LOG_DIR=/var/log/baseball
+
+0 12 * * *  cd /opt/baseball && /opt/baseball/.venv/bin/baseball daily-update --days 2 >> /var/log/baseball/cron.log 2>&1
