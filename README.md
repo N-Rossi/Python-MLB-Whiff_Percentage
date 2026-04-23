@@ -56,19 +56,6 @@ cd frontend
 npm install
 ```
 
-## Fetching data
-
-The repo ships with cached Parquet files for all six divisions (2025 season).
-To refresh or pull additional divisions:
-
-```bash
-python fetch_starters.py nl_east      # single division
-python fetch_starters.py all          # every division
-```
-
-Valid divisions: `al_east`, `al_central`, `al_west`, `nl_east`, `nl_central`,
-`nl_west`. Each run writes two Parquet files per division into `data/`.
-
 ## Running the app
 
 Open two terminals.
@@ -91,6 +78,19 @@ npm run dev
 
 Vite serves the UI on http://localhost:5173 and proxies `/api/*` to the
 backend. Open that URL in the browser.
+
+## Fetching data
+
+The repo ships with cached Parquet files for all six divisions (2025 season).
+To refresh or pull additional divisions:
+
+```bash
+python fetch_starters.py nl_east      # single division
+python fetch_starters.py all          # every division
+```
+
+Valid divisions: `al_east`, `al_central`, `al_west`, `nl_east`, `nl_central`,
+`nl_west`. Each run writes two Parquet files per division into `data/`.
 
 ## API endpoints
 
