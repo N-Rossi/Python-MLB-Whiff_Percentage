@@ -7,6 +7,11 @@ from typing import Callable
 import duckdb
 from loguru import logger
 
+from baseball.derived.batter_tables import (
+    build_batter_swing_decisions,
+    build_batter_vs_sequences,
+    build_batter_whiff_profile,
+)
 from baseball.derived.pitcher_tables import (
     build_pitcher_pitch_mix,
     build_pitcher_sequences_2pitch,
@@ -20,6 +25,9 @@ REGISTRY: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "pitcher_pitch_mix": build_pitcher_pitch_mix,
     "pitcher_zone_tendency": build_pitcher_zone_tendency,
     "pitcher_sequences_2pitch": build_pitcher_sequences_2pitch,
+    "batter_whiff_profile": build_batter_whiff_profile,
+    "batter_swing_decisions": build_batter_swing_decisions,
+    "batter_vs_sequences": build_batter_vs_sequences,
 }
 
 

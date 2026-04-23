@@ -18,10 +18,17 @@ REGULAR_SEASON_END_MMDD = "11-30"
 # `k` is the sample size at which raw and prior contribute 50/50.
 # See SAMPLE_SIZES.md for per-metric motivation.
 SHRINKAGE_K: dict[str, int] = {
+    # Pitcher tables
     "pitch_mix": 20,
     "zone_tendency": 30,
     "whiff_rate_seq": 50,
     "put_away_rate_seq": 40,
+    # Batter tables
+    "whiff_profile": 50,
+    "chase_rate": 50,
+    "z_swing_rate": 50,
+    "batter_seq_whiff": 50,
+    "batter_seq_strikeout": 40,
 }
 
 

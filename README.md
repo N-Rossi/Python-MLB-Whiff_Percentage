@@ -12,7 +12,7 @@ Data infrastructure and analytics for MLB pitch-sequencing and pitcher/batter ma
 |---|---|
 | `baseball backfill` (ingest historical Statcast) | ✅ works |
 | `baseball update` (nightly in-season pull) | ✅ works |
-| `baseball rebuild-derived` | ✅ works (3 pitcher tables; batter/matchup pending) |
+| `baseball rebuild-derived` | ✅ works (3 pitcher + 3 batter tables; `matchup_edges` pending) |
 | `baseball inspect` | ✅ works |
 | `baseball query` | ✅ works |
 | `baseball shell` (interactive SQL) | ✅ works |
@@ -89,9 +89,9 @@ data/
 │   ├── pitcher_pitch_mix.parquet              # ✅ built
 │   ├── pitcher_zone_tendency.parquet          # ✅ built
 │   ├── pitcher_sequences_2pitch.parquet       # ✅ built
-│   ├── batter_whiff_profile.parquet           # 🚧 pending
-│   ├── batter_swing_decisions.parquet         # 🚧 pending
-│   ├── batter_vs_sequences.parquet            # 🚧 pending
+│   ├── batter_whiff_profile.parquet           # ✅ built
+│   ├── batter_swing_decisions.parquet         # ✅ built
+│   ├── batter_vs_sequences.parquet            # ✅ built
 │   └── matchup_edges.parquet                  # 🚧 pending
 └── legacy/                             # frozen data for the legacy report
     └── *_starters_2025_*.parquet
@@ -189,22 +189,32 @@ baseball rebuild-derived                                 # all tables in the reg
 baseball rebuild-derived --table pitcher_pitch_mix        # just one
 ```
 
-Current pitcher tables (regular season only):
+Current tables (regular season only):
+
+**Pitcher tables:**
 
 | Table | Key | Rows (2024) | What it answers |
 |---|---|---|---|
 | `pitcher_pitch_mix` | `(pitcher, season, balls, strikes, pitch_type)` | 35k | How often does this pitcher throw this pitch type in this count? |
 | `pitcher_zone_tendency` | `(pitcher, season, pitch_type, balls, strikes, zone)` | 206k | Where does this pitcher locate this pitch type in this count? |
-| `pitcher_sequences_2pitch` | `(pitcher, season, balls_before_p1, strikes_before_p1, pitch1_type, pitch2_type)` | 93k | When this pitcher throws pitch X → pitch Y, what's the whiff rate and put-away rate on pitch Y? |
+| `pitcher_sequences_2pitch` | `(pitcher, season, balls_before_p1, strikes_before_p1, pitch1_type, pitch2_type)` | 93k | When this pitcher throws X → Y, what's the whiff rate and put-away rate on Y? |
+
+**Batter tables** (no name column — `batter` is the MLBAM ID; a lookup helper is coming in a later phase):
+
+| Table | Key | Rows (2024) | What it answers |
+|---|---|---|---|
+| `batter_whiff_profile` | `(batter, season, pitch_type, zone, balls, strikes)` | 187k | Where does this batter whiff on which pitch types? |
+| `batter_swing_decisions` | `(batter, season, balls, strikes)` | 7.6k | Chase% / z-swing% — does he expand the zone or take strikes? |
+| `batter_vs_sequences` | `(batter, season, pitch1_type, pitch2_type)` | 41k | Batter outcomes on each 2-pitch sequence faced |
 
 Every rate column ships in three flavors:
-- **`_raw`** — empirical rate from the pitcher's sample
-- **`league_*`** — the league rate for the same bucket (same count, same pitch type, etc.)
+- **`_raw`** — empirical rate from the player's sample
+- **`league_*`** — league rate at the same (pitch_type, zone, count) bucket
 - **`_shrunk`** — empirical-Bayes blend of raw toward league, tuned per metric in `config.SHRINKAGE_K`
 
-Every table also carries an explicit sample-size column (`pitch_count`, `zone_count`, `n_sequences`) so consumers can apply their own minimum thresholds. See `SAMPLE_SIZES.md` for recommended cutoffs.
+Every table also carries an explicit sample-size column (`pitch_count`, `zone_count`, `swings`, `n_sequences`, etc.) so consumers apply their own minimum thresholds. See `SAMPLE_SIZES.md` for recommended cutoffs.
 
-Batter tables (`batter_whiff_profile`, `batter_swing_decisions`, `batter_vs_sequences`) and the cross-joined `matchup_edges` table are coming next.
+The cross-joined `matchup_edges` table (pitcher tendency × batter vulnerability) is coming next.
 
 ### DuckDB for Postgres users
 
@@ -324,7 +334,8 @@ src/baseball/
 │   └── duckdb_conn.py      # DuckDB connection factory + view registration
 ├── derived/
 │   ├── _common.py          # shared helper: write_derived_parquet
-│   └── pitcher_tables.py   # pitch_mix, zone_tendency, sequences_2pitch
+│   ├── pitcher_tables.py   # pitch_mix, zone_tendency, sequences_2pitch
+│   └── batter_tables.py    # whiff_profile, swing_decisions, vs_sequences
 └── jobs/
     └── rebuild_derived.py  # REGISTRY + rebuild orchestrator
 

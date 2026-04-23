@@ -3,6 +3,11 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from baseball.derived.batter_tables import (
+    build_batter_swing_decisions,
+    build_batter_vs_sequences,
+    build_batter_whiff_profile,
+)
 from baseball.derived.pitcher_tables import (
     build_pitcher_pitch_mix,
     build_pitcher_sequences_2pitch,
@@ -427,3 +432,323 @@ def test_sequences_lag_does_not_cross_plate_appearances(isolated_data_root):
     )
     # No sequences should be produced: each PA had only one pitch.
     assert len(r) == 0
+
+
+# ---------------------------------------------------------------------------
+# batter_whiff_profile
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_pitches_for_whiff_profile(isolated_data_root):
+    """Batter 100: 3 whiffs / 5 contact = 8 swings total at FF/zone=5/0-0.
+    Batter 200: 3 whiffs / 1 contact = 4 swings total at FF/zone=5/0-0.
+    League: 6 whiffs / 12 swings → league_whiff_rate = 0.5.
+
+    Expected (k=50):
+      100: raw = 3/8 = 0.375,  shrunk = (3 + 25)/58 = 28/58
+      200: raw = 3/4 = 0.75,   shrunk = (3 + 25)/54 = 28/54
+    """
+    rows = []
+    for _ in range(3):
+        rows.append(_whiff_row(100, "FF", 5, "swinging_strike"))
+    for _ in range(5):
+        rows.append(_whiff_row(100, "FF", 5, "foul"))
+    for _ in range(3):
+        rows.append(_whiff_row(200, "FF", 5, "swinging_strike"))
+    for _ in range(1):
+        rows.append(_whiff_row(200, "FF", 5, "foul"))
+    # Non-swing (should be ignored for whiff_profile)
+    rows.append(_whiff_row(100, "FF", 5, "ball"))
+
+    df = pd.DataFrame(rows)
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    for col in ("pitcher", "batter", "game_pk", "balls", "strikes", "zone"):
+        df[col] = df[col].astype("Int64")
+
+    part = isolated_data_root / "raw" / "statcast" / "season=2024" / "month=04"
+    part.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(part / "pitches.parquet", compression="zstd", index=False)
+    return isolated_data_root
+
+
+def _whiff_row(batter: int, pitch_type: str, zone: int, description: str) -> dict:
+    return {
+        "pitcher": 999,
+        "batter": batter,
+        "player_name": "p",
+        "game_date": "2024-04-01",
+        "game_pk": 1,
+        "game_type": "R",
+        "balls": 0,
+        "strikes": 0,
+        "pitch_type": pitch_type,
+        "zone": zone,
+        "description": description,
+        "p_throws": "R",
+    }
+
+
+def test_batter_whiff_profile_ignores_non_swings(synthetic_pitches_for_whiff_profile):
+    con = get_connection()
+    register_views(con)
+    build_batter_whiff_profile(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_whiff_profile / "derived" / "batter_whiff_profile.parquet"
+    ).set_index("batter")
+    assert r.loc[100, "swings"] == 8       # not 9 — the 'ball' row excluded
+    assert r.loc[200, "swings"] == 4
+
+
+def test_batter_whiff_profile_rates(synthetic_pitches_for_whiff_profile):
+    con = get_connection()
+    register_views(con)
+    build_batter_whiff_profile(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_whiff_profile / "derived" / "batter_whiff_profile.parquet"
+    ).set_index("batter")
+
+    assert r.loc[100, "whiff_rate_raw"] == pytest.approx(3 / 8)
+    assert r.loc[200, "whiff_rate_raw"] == pytest.approx(3 / 4)
+    assert r.loc[100, "league_whiff_rate"] == pytest.approx(0.5)
+    assert r.loc[100, "whiff_rate_shrunk"] == pytest.approx(28 / 58)
+    assert r.loc[200, "whiff_rate_shrunk"] == pytest.approx(28 / 54)
+
+
+# ---------------------------------------------------------------------------
+# batter_swing_decisions
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_pitches_for_swing_decisions(isolated_data_root):
+    """All pitches are 0-0 count.
+
+    Batter 100:
+      zone=5  ×6 pitches: 3 swings (foul) + 3 takes (called_strike)
+      zone=11 ×4 pitches: 1 swing (foul) + 3 takes (ball)
+    Batter 200:
+      zone=5  ×4 pitches: 3 swings (foul) + 1 take (called_strike)
+      zone=11 ×6 pitches: 3 swings (foul) + 3 takes (ball)
+
+    League 0-0 totals: 10 in-zone (6 swings), 10 oz (4 swings)
+      league_z_swing_rate = 0.6, league_chase_rate = 0.4
+
+    Expected (k=50):
+      100: z_swing_raw = 3/6 = 0.5,  shrunk = (3 + 30)/56 = 33/56
+           chase_raw   = 1/4 = 0.25, shrunk = (1 + 20)/54 = 21/54
+      200: z_swing_raw = 3/4 = 0.75, shrunk = (3 + 30)/54 = 33/54
+           chase_raw   = 3/6 = 0.5,  shrunk = (3 + 20)/56 = 23/56
+    """
+    rows = []
+    # Batter 100
+    for _ in range(3):
+        rows.append(_swing_row(100, 5, "foul"))
+    for _ in range(3):
+        rows.append(_swing_row(100, 5, "called_strike"))
+    for _ in range(1):
+        rows.append(_swing_row(100, 11, "foul"))
+    for _ in range(3):
+        rows.append(_swing_row(100, 11, "ball"))
+    # Batter 200
+    for _ in range(3):
+        rows.append(_swing_row(200, 5, "foul"))
+    for _ in range(1):
+        rows.append(_swing_row(200, 5, "called_strike"))
+    for _ in range(3):
+        rows.append(_swing_row(200, 11, "foul"))
+    for _ in range(3):
+        rows.append(_swing_row(200, 11, "ball"))
+
+    df = pd.DataFrame(rows)
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    for col in ("pitcher", "batter", "game_pk", "balls", "strikes", "zone"):
+        df[col] = df[col].astype("Int64")
+
+    part = isolated_data_root / "raw" / "statcast" / "season=2024" / "month=04"
+    part.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(part / "pitches.parquet", compression="zstd", index=False)
+    return isolated_data_root
+
+
+def _swing_row(batter: int, zone: int, description: str) -> dict:
+    return {
+        "pitcher": 999,
+        "batter": batter,
+        "player_name": "p",
+        "game_date": "2024-04-01",
+        "game_pk": 1,
+        "game_type": "R",
+        "balls": 0,
+        "strikes": 0,
+        "pitch_type": "FF",
+        "zone": zone,
+        "description": description,
+        "p_throws": "R",
+    }
+
+
+def test_swing_decisions_counts(synthetic_pitches_for_swing_decisions):
+    con = get_connection()
+    register_views(con)
+    build_batter_swing_decisions(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_swing_decisions / "derived" / "batter_swing_decisions.parquet"
+    ).set_index("batter")
+    assert r.loc[100, "pitches_in_zone"] == 6
+    assert r.loc[100, "pitches_out_of_zone"] == 4
+    assert r.loc[100, "swings_in_zone"] == 3
+    assert r.loc[100, "swings_out_of_zone"] == 1
+
+
+def test_swing_decisions_raw_and_league_rates(synthetic_pitches_for_swing_decisions):
+    con = get_connection()
+    register_views(con)
+    build_batter_swing_decisions(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_swing_decisions / "derived" / "batter_swing_decisions.parquet"
+    ).set_index("batter")
+
+    assert r.loc[100, "z_swing_rate_raw"] == pytest.approx(0.5)
+    assert r.loc[100, "chase_rate_raw"] == pytest.approx(0.25)
+    assert r.loc[200, "z_swing_rate_raw"] == pytest.approx(0.75)
+    assert r.loc[200, "chase_rate_raw"] == pytest.approx(0.5)
+    assert r.loc[100, "league_z_swing_rate"] == pytest.approx(0.6)
+    assert r.loc[100, "league_chase_rate"] == pytest.approx(0.4)
+
+
+def test_swing_decisions_shrinkage(synthetic_pitches_for_swing_decisions):
+    con = get_connection()
+    register_views(con)
+    build_batter_swing_decisions(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_swing_decisions / "derived" / "batter_swing_decisions.parquet"
+    ).set_index("batter")
+
+    # k=50 for both metrics
+    assert r.loc[100, "z_swing_rate_shrunk"] == pytest.approx(33 / 56)
+    assert r.loc[100, "chase_rate_shrunk"] == pytest.approx(21 / 54)
+    assert r.loc[200, "z_swing_rate_shrunk"] == pytest.approx(33 / 54)
+    assert r.loc[200, "chase_rate_shrunk"] == pytest.approx(23 / 56)
+
+
+# ---------------------------------------------------------------------------
+# batter_vs_sequences
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_pitches_for_batter_seq(isolated_data_root):
+    """5 PAs of FF→SL across two batters.
+
+    Batter 100:
+      PA 1: FF(0-0, ball)          → SL(1-0, swinging_strike)        # whiff, not 2-strike
+      PA 2: FF(0-1, foul)          → SL(0-2, foul)                   # swing, 2-strike, no K
+      PA 3: FF(0-1, called_strike) → SL(0-2, swinging_strike, K)     # whiff, 2-strike, K
+    Batter 200:
+      PA 4: FF(0-0, called_strike) → SL(0-1, ball)                   # no swing, not 2-strike
+      PA 5: FF(0-1, called_strike) → SL(0-2, hit_into_play)          # swing, 2-strike, no K
+
+    Aggregates:
+      Batter 100: n=3, swings=3, whiffs=2, two_strike_p2=2, K=1
+                  whiff_raw=2/3, strikeout_raw=1/2
+      Batter 200: n=2, swings=1, whiffs=0, two_strike_p2=1, K=0
+                  whiff_raw=0,   strikeout_raw=0
+      League:     n=5, swings=4, whiffs=2, two_strike=3, K=1
+                  league_whiff=0.5, league_strikeout=1/3
+
+    Expected shrunk (k_whiff=50, k_K=40):
+      Batter 100 whiff_shrunk = (2 + 25)/53 = 27/53
+      Batter 100 strikeout_shrunk = (1 + 40/3)/42
+    """
+    rows = []
+    # PA 1
+    rows.append(_pa_row(100, 1, 1, "FF", 0, 0, "ball", None))
+    rows.append(_pa_row(100, 1, 2, "SL", 1, 0, "swinging_strike", None))
+    # PA 2
+    rows.append(_pa_row(100, 2, 1, "FF", 0, 1, "foul", None))
+    rows.append(_pa_row(100, 2, 2, "SL", 0, 2, "foul", None))
+    # PA 3
+    rows.append(_pa_row(100, 3, 1, "FF", 0, 1, "called_strike", None))
+    rows.append(_pa_row(100, 3, 2, "SL", 0, 2, "swinging_strike", "strikeout"))
+    # PA 4
+    rows.append(_pa_row(200, 4, 1, "FF", 0, 0, "called_strike", None))
+    rows.append(_pa_row(200, 4, 2, "SL", 0, 1, "ball", None))
+    # PA 5
+    rows.append(_pa_row(200, 5, 1, "FF", 0, 1, "called_strike", None))
+    rows.append(_pa_row(200, 5, 2, "SL", 0, 2, "hit_into_play", None))
+
+    df = pd.DataFrame(rows)
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    for col in ("pitcher", "batter", "game_pk", "at_bat_number", "pitch_number",
+                "balls", "strikes"):
+        df[col] = df[col].astype("Int64")
+
+    part = isolated_data_root / "raw" / "statcast" / "season=2024" / "month=04"
+    part.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(part / "pitches.parquet", compression="zstd", index=False)
+    return isolated_data_root
+
+
+def _pa_row(
+    batter: int, ab: int, pn: int, pitch_type: str,
+    balls: int, strikes: int, description: str, events: str | None,
+) -> dict:
+    return {
+        "pitcher": 999,
+        "batter": batter,
+        "player_name": "p",
+        "game_date": "2024-04-01",
+        "game_pk": 1,
+        "at_bat_number": ab,
+        "pitch_number": pn,
+        "game_type": "R",
+        "pitch_type": pitch_type,
+        "balls": balls,
+        "strikes": strikes,
+        "description": description,
+        "events": events,
+        "p_throws": "R",
+    }
+
+
+def test_batter_vs_sequences_aggregates(synthetic_pitches_for_batter_seq):
+    con = get_connection()
+    register_views(con)
+    build_batter_vs_sequences(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_batter_seq / "derived" / "batter_vs_sequences.parquet"
+    ).set_index("batter")
+
+    assert r.loc[100, "n_sequences"] == 3
+    assert r.loc[100, "swings_on_p2"] == 3
+    assert r.loc[100, "whiffs_on_p2"] == 2
+    assert r.loc[100, "two_strike_p2"] == 2
+    assert r.loc[100, "strikeouts_on_p2"] == 1
+
+    assert r.loc[200, "n_sequences"] == 2
+    assert r.loc[200, "swings_on_p2"] == 1
+    assert r.loc[200, "two_strike_p2"] == 1
+
+
+def test_batter_vs_sequences_rates(synthetic_pitches_for_batter_seq):
+    con = get_connection()
+    register_views(con)
+    build_batter_vs_sequences(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_batter_seq / "derived" / "batter_vs_sequences.parquet"
+    ).set_index("batter")
+
+    assert r.loc[100, "whiff_rate_raw"] == pytest.approx(2 / 3)
+    assert r.loc[100, "strikeout_rate_raw"] == pytest.approx(0.5)
+    assert r.loc[100, "whiff_rate_shrunk"] == pytest.approx(27 / 53)
+    # strikeout_rate_shrunk = (1 + 40*(1/3)) / (2 + 40)
+    expected_k = (1 + 40 * (1 / 3)) / 42
+    assert r.loc[100, "strikeout_rate_shrunk"] == pytest.approx(expected_k)
