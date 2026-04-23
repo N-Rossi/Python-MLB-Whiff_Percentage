@@ -1,426 +1,274 @@
 # MLB Pitch Analytics Platform
 
-Data infrastructure and analytics for MLB pitch-sequencing and pitcher/batter matchup edges. The repo has three parts:
+Data infrastructure + interactive web UI for MLB pitch-sequencing and pitcher/batter matchup edges. Pulls Statcast via `pybaseball`, aggregates into DuckDB-queryable derived tables, and surfaces two analyzers on top:
 
-1. **`src/baseball/`** — the main data pipeline (ingest Statcast → Parquet → DuckDB → derived tables). Phase 1 complete.
-2. **`reports/`** — a blog-style archive of standalone one-off analyses. Each report is self-contained and deliberately kept separate from the main pipeline.
-3. **`backend/` + `frontend/`** — a legacy FastAPI + React web app that surfaces the first-pitch offspeed report. Will eventually be rewired on top of the new data pipeline; for now it runs against frozen data in `data/legacy/`.
+- **Pitch-sequence analyzer** — every 2-pitch combo a pitcher throws (or a batter faces), with empirical-Bayes shrinkage and league comparison.
+- **Matchup edges** — pitcher tendency × batter vulnerability per (pitch, count). Finds the single highest-leverage pitch in any pitcher-batter matchup.
 
-**Documentation:**
-- **[TABLES.md](TABLES.md)** — plain-English explanation of every table and column (start here if you're new).
-- **[SAMPLE_SIZES.md](SAMPLE_SIZES.md)** — minimum-sample conventions and empirical-Bayes shrinkage approach.
-- **[deploy/README.md](deploy/README.md)** — VM deployment: cron / systemd timer setup.
+---
 
-## Status
+## Quickstart
 
-| Component | State |
-|---|---|
-| `baseball backfill` (one-time historical ingest) | ✅ works |
-| `baseball update` (single-day ingest) | ✅ works |
-| `baseball daily-update` (cron entrypoint: ingest + rebuild) | ✅ works |
-| `baseball rebuild-derived` | ✅ works — all 7 derived tables |
-| `baseball inspect` | ✅ works |
-| `baseball query` | ✅ works |
-| `baseball shell` (interactive SQL) | ✅ works |
-| Nightly cron deployment (systemd / crontab) | ✅ templates ready in `deploy/` |
-| Legacy FastAPI + React app | ✅ runs against `data/legacy/` |
-
-## Requirements
-
-- Python **3.11+** (tested on 3.14)
-- Node 18+ (only for the legacy frontend)
-- ~2 GB free disk for the full 2015–present raw Statcast + derived tables
-
-## Setup
+### 1. One-time setup
 
 ```bash
 git clone <repo-url>
 cd Python-MLB-Whiff_Percentage
 
 python -m venv .venv
-
-# Activate the venv
-source .venv/bin/activate            # macOS / Linux
-source .venv/Scripts/activate        # Windows (Git Bash)
-.venv\Scripts\activate               # Windows (cmd)
-.venv\Scripts\Activate.ps1           # Windows (PowerShell)
+# activate — pick the line for your shell:
+source .venv/bin/activate            # macOS / Linux / Git Bash
+.venv\Scripts\Activate.ps1           # Windows PowerShell
 
 pip install -r requirements.txt
-pip install -r requirements-dev.txt
 pip install -e .                     # registers the `baseball` CLI
-
-cp .env.example .env                 # optional; adjust as needed
-baseball --help
 ```
 
-## Data pipeline
-
-### Ingest
-
-Pulls pitch-level Statcast data from Baseball Savant via `pybaseball`, one week at a time, into partitioned Parquet.
+Populate data (takes ~30 min for full history; pick a single season if you just want to test):
 
 ```bash
-# Full backfill (2015 through current season). Runs for an hour-ish.
-baseball backfill --start-season 2015 --end-season 2026
-
-# Single season
-baseball backfill --start-season 2024 --end-season 2024
-
-# Single day (intended for a nightly in-season cron)
-baseball update --date 2024-04-15
-baseball update                      # defaults to yesterday
-
-# Force re-pull even if the week is already cached
-baseball backfill --start-season 2024 --end-season 2024 --force
-
-# Full nightly cron cycle: ingest last N days + rebuild derived tables
-baseball daily-update                # yesterday only
-baseball daily-update --days 3       # catch up last 3 days
-baseball daily-update --skip-rebuild # ingest only
+baseball backfill --start-season 2024 --end-season 2024    # single season (~5 min)
+baseball backfill --start-season 2015 --end-season 2026    # full history (~1 hour)
+baseball rebuild-derived
 ```
 
-The difference between `update` and `daily-update`: `update` pulls one day and stops. `daily-update` is the full cron cycle — it pulls the last N days, then rebuilds all derived tables so `matchup_edges` and the `_shrunk` columns reflect the fresh data. See **[deploy/README.md](deploy/README.md)** for VM deployment.
+### 2. Run locally
 
-**Idempotency.** A sidecar `.manifest.json` at `data/raw/statcast/.manifest.json` tracks completed weeks. Re-running any command skips weeks that are already on disk. The cache is self-healing — if you delete a Parquet partition, the next run detects the missing file and re-pulls. Use `--force` to bypass the cache entirely.
-
-**Rate limiting.** Pulls are chunked to one-week windows with a 0.5s sleep between weeks to be polite to Baseball Savant.
-
-### Data layout
-
-```
-data/
-├── raw/
-│   └── statcast/
-│       ├── season=2024/
-│       │   ├── month=03/
-│       │   │   └── pitches.parquet
-│       │   ├── month=04/
-│       │   │   └── pitches.parquet
-│       │   └── ...
-│       ├── season=2025/
-│       └── .manifest.json              # completed-week tracker
-├── derived/                            # rebuilt by `baseball rebuild-derived`
-│   ├── pitcher_pitch_mix.parquet              # ✅ built
-│   ├── pitcher_zone_tendency.parquet          # ✅ built
-│   ├── pitcher_sequences_2pitch.parquet       # ✅ built
-│   ├── batter_whiff_profile.parquet           # ✅ built
-│   ├── batter_swing_decisions.parquet         # ✅ built
-│   ├── batter_vs_sequences.parquet            # ✅ built
-│   └── matchup_edges.parquet                  # ✅ built (+ `matchup_edges_top` view)
-└── legacy/                             # frozen data for the legacy report
-    └── *_starters_2025_*.parquet
-```
-
-The whole `data/raw/` and `data/derived/` tree is gitignored. `data/legacy/` is tracked for now so the legacy report works on a fresh clone.
-
-### Expected disk usage
-
-| Scope | Compressed size (ZSTD) |
-|---|---|
-| One week of Statcast (all pitches) | ~3.5 MB |
-| One full season | ~120 MB |
-| 2015 through 2026 (raw) | ~1.4 GB |
-| Derived tables | ~200–400 MB |
-
-Comfortably under the 8 GB VM budget.
-
-### Schema
-
-Raw Parquet partitions preserve every column `pybaseball.statcast()` returns (~118 columns). ID-like columns (`pitcher`, `batter`, `game_pk`, etc.) are cast to pandas nullable `Int64`; `game_date` is `datetime64`. No columns are dropped at ingest time.
-
-### Querying
-
-Data is exposed through **DuckDB**, an embedded SQL engine. Queries hit a `pitches` view that reads directly from `data/raw/statcast/**/*.parquet` — no load-into-database step. Any `data/derived/*.parquet` is auto-registered as a view named after its filename (so `pitcher_pitch_mix.parquet` becomes the `pitcher_pitch_mix` view).
-
-Three ways to query, in increasing order of interactivity:
-
-#### `baseball query` — one-off SQL
+Two terminals:
 
 ```bash
-baseball query "SELECT COUNT(*) FROM pitches"
-baseball query "SELECT player_name, COUNT(*) FROM pitches WHERE season=2024 GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
-```
-
-Returns up to 100 rows formatted as a table. Use this for scripting or quick spot-checks.
-
-#### `baseball inspect` — diagnostics
-
-```bash
-baseball inspect --table pitches --season 2024
-```
-
-Prints row count, unique game count, date range, unique pitchers/batters, and null rates on key columns. Useful for verifying ingest completeness.
-
-#### `baseball shell` — interactive prompt (recommended for exploration)
-
-Think `psql`, but for DuckDB. Drops into a SQL prompt with all views pre-registered.
-
-```
-$ baseball shell
-Connected. Tables: pitches
-Type SQL (terminate with ;).  \d TABLE for schema, \dt for table list, \q to quit.
-
-baseball> \dt
-  pitches
-
-baseball> \d pitches
-   column_name     column_type  ...
-     pitch_type         VARCHAR  ...
-      game_date  TIMESTAMP_NS   ...
-            ...
-
-baseball> SELECT pitch_type, COUNT(*) AS n
-       -> FROM pitches WHERE season=2024 AND game_type='R'
-       -> GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
- pitch_type      n
-         FF 225989
-         SI 112095
-         SL 106065
-         CH  72240
-         FC  58222
-
-baseball> \q
-```
-
-Commands:
-
-| Input | Effect |
-|---|---|
-| `SELECT ...;` | Run SQL — statements terminated by `;`, can span multiple lines |
-| `\d TABLENAME` | Describe a table's schema (like `\d` in psql) |
-| `\dt` | List all registered tables |
-| `\q` / `exit` / `quit` / Ctrl-D | Exit the shell |
-| Ctrl-C | Cancel the current multi-line buffer without exiting |
-
-Command history and line editing work if the `readline` module is available (Unix default; on Windows install `pyreadline3` if you want arrow-key history).
-
-#### `baseball rebuild-derived` — build derived Parquet tables
-
-Aggregates the raw `pitches` into queryable summary tables under `data/derived/`. Each table is auto-registered as a view in subsequent `baseball query` / `baseball shell` sessions.
-
-```bash
-baseball rebuild-derived                                 # all tables in the registry
-baseball rebuild-derived --table pitcher_pitch_mix        # just one
-```
-
-Current tables (regular season only):
-
-**Pitcher tables:**
-
-| Table | Key | Rows (2024) | What it answers |
-|---|---|---|---|
-| `pitcher_pitch_mix` | `(pitcher, season, balls, strikes, pitch_type)` | 35k | How often does this pitcher throw this pitch type in this count? |
-| `pitcher_zone_tendency` | `(pitcher, season, pitch_type, balls, strikes, zone)` | 206k | Where does this pitcher locate this pitch type in this count? |
-| `pitcher_sequences_2pitch` | `(pitcher, season, balls_before_p1, strikes_before_p1, pitch1_type, pitch2_type)` | 93k | When this pitcher throws X → Y, what's the whiff rate and put-away rate on Y? |
-
-**Batter tables** (no name column — `batter` is the MLBAM ID; a lookup helper is coming in a later phase):
-
-| Table | Key | Rows (2024) | What it answers |
-|---|---|---|---|
-| `batter_whiff_profile` | `(batter, season, pitch_type, zone, balls, strikes)` | 187k | Where does this batter whiff on which pitch types? |
-| `batter_swing_decisions` | `(batter, season, balls, strikes)` | 7.6k | Chase% / z-swing% — does he expand the zone or take strikes? |
-| `batter_vs_sequences` | `(batter, season, pitch1_type, pitch2_type)` | 41k | Batter outcomes on each 2-pitch sequence faced |
-
-Every rate column ships in three flavors:
-- **`_raw`** — empirical rate from the player's sample
-- **`league_*`** — league rate at the same (pitch_type, zone, count) bucket
-- **`_shrunk`** — empirical-Bayes blend of raw toward league, tuned per metric in `config.SHRINKAGE_K`
-
-Every table also carries an explicit sample-size column (`pitch_count`, `zone_count`, `swings`, `n_sequences`, etc.) so consumers apply their own minimum thresholds. See `SAMPLE_SIZES.md` for recommended cutoffs.
-
-**Matchup table:**
-
-| Table | Key | Rows (2024) | What it answers |
-|---|---|---|---|
-| `matchup_edges` | `(pitcher, batter, season, pitch_type, balls, strikes)` | 3.85M | For every (pitcher, batter) pair that actually met: where's the leverage? |
-
-Per-row columns include both sides' sample sizes, the batter's shrunk whiff rate, the league baseline, and two edge metrics:
-
-- **`edge_lift`** = `batter_whiff_shrunk - league_whiff_rate` — the batter's excess vulnerability (independent of pitcher).
-- **`edge_weighted`** = `pitcher_pct_shrunk × edge_lift` — leverage weighted by the pitcher actually throwing that pitch.
-
-A convenience view **`matchup_edges_top`** is auto-registered alongside and rolls up to one row per `(pitcher, batter, season)` with the top-3 edges surfaced as columns. Good for building pairwise-matchup UIs without the frontend needing to aggregate.
-
-```sql
--- Which pitches does Skubal hunt Juan Soto with?
-SELECT pitch_type, balls, strikes, pitcher_n, batter_swings,
-       ROUND(edge_lift*100, 1) AS lift_pp,
-       ROUND(edge_weighted*1000, 1) AS weighted_x1000
-FROM matchup_edges
-WHERE player_name = 'Skubal, Tarik' AND batter = 665742
-ORDER BY edge_weighted DESC LIMIT 5;
-```
-
-### DuckDB for Postgres users
-
-If you're coming from Postgres, nearly everything transfers — CTEs, window functions, joins, aggregates, `CASE`, `EXTRACT()`, `DATE_TRUNC()`, identifier quoting, string concat with `||`. A few differences worth knowing:
-
-| Task | Postgres | DuckDB |
-|---|---|---|
-| List tables | `\dt` | `SHOW TABLES` (or `\dt` inside `baseball shell`) |
-| Describe table | `\d table` | `DESCRIBE table` (or `\d table` inside `baseball shell`) |
-| Connection | TCP to a server | Embedded — no server, no port |
-| Query a file | Foreign data wrapper / `COPY` | `SELECT * FROM read_parquet('*.parquet')` |
-| Show settings | `SHOW ALL` | `SELECT * FROM duckdb_settings()` |
-
-DuckDB-only tricks worth stealing:
-
-- `SELECT * EXCLUDE (col_a, col_b) FROM t` — project everything *except* listed columns.
-- `SELECT * REPLACE (CAST(x AS INT) AS x) FROM t` — swap a single column's value while keeping position.
-- `read_parquet('dir/**/*.parquet', hive_partitioning=true)` — auto-extract `season=...` / `month=...` from paths into virtual columns (this is how our `pitches` view is built).
-- `EXPLAIN ANALYZE <query>` works like Postgres.
-- `SUMMARIZE table` — one-liner descriptive stats (min/max/avg/null-count) across every column.
-
-Full DuckDB docs: https://duckdb.org/docs/
-
-### Example validation queries
-
-```sql
--- Pitch type distribution (regular season)
-SELECT pitch_type, COUNT(*) AS n,
-       COUNT(*) * 100.0 / SUM(COUNT(*)) OVER () AS pct
-FROM pitches WHERE season = 2024 AND game_type = 'R'
-GROUP BY pitch_type ORDER BY n DESC;
-
--- Velo leaderboard, fastballs only, min 200 thrown
-SELECT player_name, AVG(release_speed) AS avg_velo, COUNT(*) AS fastballs
-FROM pitches
-WHERE season = 2024 AND pitch_type IN ('FF','SI','FT') AND release_speed IS NOT NULL
-GROUP BY player_name HAVING COUNT(*) > 200
-ORDER BY avg_velo DESC LIMIT 20;
-
--- Whiff% by count (swings that miss / total swings)
-SELECT balls || '-' || strikes AS count,
-       SUM(CASE WHEN description = 'swinging_strike' THEN 1 ELSE 0 END) * 1.0 /
-       NULLIF(SUM(CASE WHEN description IN ('swinging_strike','foul','foul_tip','hit_into_play') THEN 1 ELSE 0 END), 0) AS whiff_rate,
-       COUNT(*) AS pitches
-FROM pitches WHERE season = 2024 AND game_type = 'R'
-GROUP BY 1 ORDER BY 1;
-
--- Sanity: row counts by (season, month) to confirm partition coverage
-SELECT season, month, COUNT(*) AS n FROM pitches GROUP BY 1, 2 ORDER BY 1, 2;
-```
-
-## API (v2)
-
-All endpoints for the sequence analyzer and matchup-edges UI live under `/api/v2/*` in `backend/v2/`. They read the derived Parquet via a single long-lived DuckDB connection opened at app startup. No caching layer — DuckDB over Parquet is already sub-100ms for these queries.
-
-Interactive docs: `http://localhost:8000/docs` (dev) or `http://<vm-ip>:8000/docs` (deployed).
-
-### Lookup endpoints (dropdowns)
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/v2/seasons` | seasons with derived data, newest first |
-| `GET /api/v2/pitch-types` | pitch-type codes + human labels |
-| `GET /api/v2/pitchers?season&q&limit` | type-ahead pitcher search |
-| `GET /api/v2/batters?season&q&limit` | type-ahead batter search (Chadwick-backed) |
-
-### Pitch-sequence analyzer
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/v2/sequences/pitcher/{id}` | one pitcher's 2-pitch combos, filterable by `season`, `balls`, `strikes`, `pitch1`, `pitch2`, `min_n`, `sort`, `limit` |
-| `GET /api/v2/sequences/batter/{id}` | one batter's outcomes on 2-pitch combos (no count slicing — the derived table rolls these up) |
-| `GET /api/v2/sequences/leaderboard?pitch1&pitch2&season&role&balls&strikes&min_n&limit` | top players on a specific sequence, ranked by lift vs league |
-
-### Matchup edges
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/v2/matchup/pairing/{pitcher_id}/{batter_id}?season` | scouting card for one pair: top-3 edges + every (pitch, count) row sorted by leverage |
-| `GET /api/v2/matchup/edges/top?season&pitcher_id&batter_id&pitch_type&balls&strikes&min_pitcher_n&min_batter_swings&sort&limit` | general-purpose top-N over `matchup_edges` |
-
-### Batter names (Chadwick Bureau)
-
-The derived tables only store batter MLBAM IDs. On first startup the v2 API fetches Chadwick Bureau's public player register via `pybaseball.chadwick_register()` and caches a trimmed `(id, first, last)` lookup to `data/player_names.parquet` (~1 MB, 25K rows, ~4s to build). The file is gitignored and rebuilt automatically if deleted. If the fetch fails (no network on first launch) batter endpoints fall back to `id:665742`-style labels and keep working.
-
-## Legacy web app
-
-The first-pitch offspeed CSW% / whiff% report lives at `reports/first_pitch_offspeed/` and is served by the same FastAPI app (legacy `/api/*` endpoints) + a React frontend. It runs against frozen per-division Parquet in `data/legacy/` and is unaffected by the new pipeline.
-
-```bash
-# Backend (terminal 1)
+# terminal 1 — API
 python -m uvicorn backend.main:app --reload --port 8000
 
-# Frontend (terminal 2)
+# terminal 2 — frontend
 cd frontend
 npm install
 npm run dev
 ```
 
-UI on http://localhost:5173, interactive API docs on http://localhost:8000/docs.
+Open **http://localhost:5173**. Interactive API docs at http://localhost:8000/docs.
 
-To point the local frontend at the deployed VM API instead of a local uvicorn, create `frontend/.env.local` with `VITE_API_TARGET=http://<vm-ip>:8000` and restart `npm run dev`.
+### 3. Or — frontend against the deployed VM
 
-## Reports
-
-`reports/` is a blog-style archive of standalone analyses. Each report is self-contained and does not share data infrastructure with the main pipeline — think of it as a place for one-off deep dives and historical artifacts.
-
-Current reports:
-
-- **First-pitch offspeed** (`reports/first_pitch_offspeed/`) — do hard throwers (96+ mph fastball) get more whiffs / CSW% when leading an at-bat with an offspeed pitch than soft throwers?
-
-## Development
-
-### Tests
+If you don't want to start uvicorn locally (or you don't have the data backfilled), the frontend can proxy to the production VM API instead:
 
 ```bash
-pytest tests/ -v
+cd frontend
+npm run dev:vm
 ```
 
-### Lint / format
+No backend needed on your laptop.
 
-```bash
-ruff check src/ tests/
-ruff format src/ tests/
-# or
-black src/ tests/
+### Things to try
+
+- **Sequences → Pitcher view**: pick Skubal, pitch1 FF, pitch2 CH, count 0-2 → his ~2.5× league putaway edge.
+- **Sequences → Batter view**: pick Juan Soto, sort by "Whiff lift vs league" → surfaces his worst sequences.
+- **Matchup**: pick Skubal + Soto → best edge CH in 1-2. Toggle perspective to "Batter" to see Soto's best spots.
+- **Ad-hoc SQL**: `baseball shell` drops into a psql-like prompt with every table pre-registered.
+
+### Further reading
+
+- **[TABLES.md](TABLES.md)** — plain-English guide to every table & column (start here if you're new to the data).
+- **[SAMPLE_SIZES.md](SAMPLE_SIZES.md)** — minimum-sample conventions and empirical-Bayes shrinkage.
+- **[deploy/README.md](deploy/README.md)** — VM deployment walkthrough.
+
+---
+
+## CLI reference
+
+The `baseball` command group (installed by `pip install -e .`):
+
+| Command | Purpose |
+|---|---|
+| `baseball backfill --start-season S --end-season E` | one-time historical Statcast pull |
+| `baseball update [--date YYYY-MM-DD]` | single-day ingest (defaults to yesterday) |
+| `baseball daily-update [--days N]` | cron entrypoint: ingest last N days + rebuild |
+| `baseball rebuild-derived [--table T]` | recompute derived Parquet tables |
+| `baseball inspect --table T [--season S]` | row counts, date range, null rates |
+| `baseball query "SELECT ..."` | one-off SQL against the data |
+| `baseball shell` | interactive SQL prompt |
+
+Run `baseball <cmd> --help` for flags.
+
+**Idempotency.** `data/raw/statcast/.manifest.json` tracks completed weeks — re-running any command skips work already done. Pass `--force` to bypass.
+
+**Rate limiting.** Pulls are chunked one week at a time with a 0.5s sleep between weeks, out of respect for Baseball Savant.
+
+**`update` vs `daily-update`.** `update` pulls one day and stops. `daily-update` is the full cron cycle — pulls the last N days, then rebuilds all derived tables so `matchup_edges` and the `_shrunk` columns reflect the fresh data.
+
+---
+
+## Data pipeline
+
+### Layout
+
+```
+data/
+├── raw/statcast/
+│   ├── season=2024/month=03/pitches.parquet
+│   ├── season=2024/month=04/pitches.parquet
+│   └── .manifest.json                    # completed-week tracker
+├── derived/                              # rebuilt by `baseball rebuild-derived`
+│   ├── pitcher_pitch_mix.parquet
+│   ├── pitcher_zone_tendency.parquet
+│   ├── pitcher_sequences_2pitch.parquet
+│   ├── batter_whiff_profile.parquet
+│   ├── batter_swing_decisions.parquet
+│   ├── batter_vs_sequences.parquet
+│   └── matchup_edges.parquet             # + `matchup_edges_top` view
+└── legacy/                               # frozen data for the legacy FPO report
+    └── *_starters_2025_*.parquet
 ```
 
-### Configuration
+`data/raw/` and `data/derived/` are gitignored; `data/legacy/` is tracked so the legacy report runs on a fresh clone.
 
-All settings live in `.env` (copy from `.env.example`):
+### Disk usage
 
-| Variable | Default | Purpose |
+| Scope | Compressed (ZSTD) |
+|---|---|
+| One week of Statcast | ~3.5 MB |
+| One full season | ~120 MB |
+| 2015 – 2026 raw | ~1.4 GB |
+| Derived tables | ~200–400 MB |
+
+### Schema
+
+Raw Parquet preserves every column `pybaseball.statcast()` returns (~118). ID-like columns are cast to pandas nullable `Int64`; `game_date` is `datetime64`. No columns dropped at ingest.
+
+### Querying
+
+Data is exposed via **DuckDB** — embedded, no server. A `pitches` view reads `data/raw/statcast/**/*.parquet` directly (no load step). Every `data/derived/*.parquet` auto-registers as a view named after its filename.
+
+`baseball shell` drops into a psql-style prompt:
+
+```
+baseball> \dt
+  pitches
+  pitcher_pitch_mix
+  matchup_edges
+  ...
+
+baseball> SELECT pitch_type, COUNT(*) n
+       -> FROM pitches WHERE season=2024 AND game_type='R'
+       -> GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
+```
+
+Commands: `\dt` list tables · `\d TABLE` describe · `\q` / Ctrl-D exit · Ctrl-C cancel multi-line buffer.
+
+---
+
+## Derived tables
+
+Seven tables from `rebuild-derived`. Regular season only. See [TABLES.md](TABLES.md) for full column-by-column docs.
+
+**Pitcher tables**
+
+| Table | Key | What it answers |
 |---|---|---|
-| `BASEBALL_LOG_LEVEL` | `INFO` | loguru level |
-| `BASEBALL_DUCKDB_MEMORY_LIMIT` | unset | Memory cap for DuckDB (e.g. `4GB` on the 8 GB VM) |
-| `BASEBALL_DATA_ROOT` | `./data` | Override data directory (e.g. mounted disk) |
+| `pitcher_pitch_mix` | `(pitcher, season, balls, strikes, pitch_type)` | How often does this pitcher throw this pitch in this count? |
+| `pitcher_zone_tendency` | `(pitcher, season, pitch_type, balls, strikes, zone)` | Where does he locate it? |
+| `pitcher_sequences_2pitch` | `(pitcher, season, balls_before_p1, strikes_before_p1, pitch1_type, pitch2_type)` | On X → Y, what's the whiff rate and put-away rate on Y? |
 
-### Sample-size conventions
+**Batter tables** (batter column is MLBAM ID; names via Chadwick Bureau at API level)
 
-See **[SAMPLE_SIZES.md](SAMPLE_SIZES.md)** for the minimum-sample thresholds and empirical-Bayes shrinkage approach used by derived tables. The short version: we store every sample in derived tables without filtering, and thresholds / shrinkage are applied at query time.
+| Table | Key | What it answers |
+|---|---|---|
+| `batter_whiff_profile` | `(batter, season, pitch_type, zone, balls, strikes)` | Where does this batter whiff? |
+| `batter_swing_decisions` | `(batter, season, balls, strikes)` | Chase% / z-swing% |
+| `batter_vs_sequences` | `(batter, season, pitch1_type, pitch2_type)` | Outcomes on each 2-pitch sequence faced |
 
-## Deployment (nightly cron on a VM)
+**Matchup table**
 
-The full cycle — **ingest yesterday + rebuild derived tables** — is wrapped up in `baseball daily-update`. Templates for both **systemd timer** (recommended, DST-aware) and **crontab** (simpler, UTC only) live in the `deploy/` directory.
+| Table | Key | What it answers |
+|---|---|---|
+| `matchup_edges` | `(pitcher, batter, season, pitch_type, balls, strikes)` | For every pair that met: where's the leverage? |
 
-Quickstart on a fresh Linux VM:
+Plus the `matchup_edges_top` view — one row per pair, top-3 edges surfaced as columns (ready for UI consumption).
+
+**Rate columns ship three ways:** `_raw` (empirical), `league_*` (league baseline at the same bucket), `_shrunk` (empirical-Bayes blend, tuned per metric in `config.SHRINKAGE_K`). Every table also carries an explicit sample-size column. Apply minimum thresholds at query time — see [SAMPLE_SIZES.md](SAMPLE_SIZES.md).
+
+**Edge metrics:**
+
+- **`edge_lift`** = `batter_whiff_shrunk - league_whiff_rate` — batter's excess vulnerability, pitcher-independent.
+- **`edge_weighted`** = `pitcher_pct_shrunk × edge_lift` — leverage, only big when the pitcher actually throws the pitch.
+
+---
+
+## API v2
+
+All endpoints for the analyzer UI live under `/api/v2/*` in `backend/v2/`. They read the derived Parquet via a single long-lived DuckDB connection opened at app startup. No caching layer — DuckDB over Parquet is sub-100ms.
+
+Interactive docs: http://localhost:8000/docs (dev) · `http://<vm-ip>:8000/docs` (deployed).
+
+**Lookups (dropdowns)**
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v2/seasons` | seasons available |
+| `GET /api/v2/pitch-types` | codes + human labels |
+| `GET /api/v2/pitchers?season&q&limit` | type-ahead pitcher search |
+| `GET /api/v2/batters?season&q&limit` | type-ahead batter search (Chadwick-backed) |
+
+**Pitch-sequence analyzer**
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v2/sequences/pitcher/{id}` | one pitcher's combos, filterable by `season`, `balls`, `strikes`, `pitch1`, `pitch2`, `min_n`, `sort`, `limit` |
+| `GET /api/v2/sequences/batter/{id}` | one batter's combos (rolled up across counts) |
+| `GET /api/v2/sequences/leaderboard?pitch1&pitch2&season&role&balls&strikes&min_n&limit` | top players on a specific sequence |
+
+**Matchup edges**
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v2/matchup/pairing/{pitcher_id}/{batter_id}?season` | scouting card for one pair |
+| `GET /api/v2/matchup/edges/top?season&pitcher_id&batter_id&pitch_type&balls&strikes&min_pitcher_n&min_batter_swings&sort&perspective&limit` | general-purpose top-N; `perspective=pitcher` (default) or `batter` flips the sort direction |
+
+**Batter names.** The derived tables only store batter MLBAM IDs. On first API startup, `/api/v2/batters` fetches Chadwick Bureau's public register via `pybaseball.chadwick_register()` and caches a trimmed lookup to `data/player_names.parquet` (~1 MB, ~4s to build, gitignored). If the fetch fails, batter endpoints fall back to `id:665742`-style labels.
+
+---
+
+## Frontend (React)
+
+`frontend/` is a Vite + React app. `/api/*` requests are proxied server-side to whichever backend the selected mode points at — the browser always thinks it's same-origin with `localhost:5173`, so no CORS setup.
+
+**Switching between local and VM backend**
+
+| Command | Proxy target | Need local uvicorn? |
+|---|---|---|
+| `npm run dev` | `http://127.0.0.1:8000` (from `.env.development`) | **Yes** |
+| `npm run dev:vm` | VM (from `.env.vm`) | No |
+
+Env-file precedence (later wins): `.env` → `.env.local` → `.env.[mode]` → `.env.[mode].local`. The mode files (`.env.development`, `.env.vm`) override any `.env.local`, so you can leave a `.env.local` in place for one-off overrides (a colleague's VM, a staging box) without worrying about it bleeding into the normal scripts.
+
+**If the VM IP rotates** — edit `frontend/.env.vm` and commit.
+
+---
+
+## Deployment (Oracle VM)
+
+Nightly cron and the API both run on the same Ubuntu 24.04 ARM VM. See [deploy/README.md](deploy/README.md) for the full walkthrough; quickstart summary below.
+
+### Nightly cron (ingest + rebuild)
+
+Templates for **systemd timer** (recommended, DST-aware) and **crontab** (simpler, UTC only) live in `deploy/`.
 
 ```bash
 git clone <repo-url> /opt/baseball
 cd /opt/baseball
-python3.11 -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt && .venv/bin/pip install -e .
 .venv/bin/baseball backfill --start-season 2015 --end-season $(date +%Y)
 .venv/bin/baseball rebuild-derived
 
-# Systemd timer (recommended)
-sudo useradd --system --create-home --shell /usr/sbin/nologin baseball
-sudo mkdir -p /var/log/baseball
-sudo chown -R baseball:baseball /opt/baseball /var/log/baseball
+# systemd timer
 sudo cp deploy/systemd/baseball-daily-update.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now baseball-daily-update.timer
 ```
 
-See **[deploy/README.md](deploy/README.md)** for the full walkthrough, crontab alternative, troubleshooting, and environment-variable knobs (memory cap, log directory).
+### API service (FastAPI)
 
-### API service (FastAPI on the VM)
-
-The FastAPI app in `backend/main.py` runs as a long-lived systemd service. On boot it auto-starts, on crash it auto-restarts — you never manually run `uvicorn` on the VM.
-
-One-time install on the VM:
+The FastAPI app runs as a long-lived systemd service — auto-starts on boot, auto-restarts on crash.
 
 ```bash
 sudo tee /etc/systemd/system/mlb-api.service > /dev/null <<'EOF'
@@ -443,67 +291,138 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now mlb-api.service
+sudo systemctl daemon-reload && sudo systemctl enable --now mlb-api.service
 ```
 
-Open port 8000 to the public internet (**two layers** — both required on OCI):
+### Opening port 8000 (OCI)
+
+Two layers, both required:
 
 ```bash
-# Host firewall: insert BEFORE the REJECT rule — check `sudo iptables -L INPUT --line-numbers` first
+# 1. Host firewall — insert BEFORE the REJECT line; verify with `sudo iptables -L INPUT --line-numbers`
 sudo iptables -I INPUT 5 -p tcp --dport 8000 -j ACCEPT
 sudo apt install -y iptables-persistent
 sudo netfilter-persistent save
 ```
 
-Then in the OCI console: **Networking → Virtual Cloud Networks →** your VCN **→ Security Lists →** Default **→ Add Ingress Rules** (source `0.0.0.0/0`, TCP, port 8000).
+```
+# 2. OCI console — Networking → VCN → Security Lists → Default → Add Ingress Rules
+#    Source: 0.0.0.0/0, TCP, port 8000
+```
 
-**Daily ops** (after `git push` from laptop):
+### Daily ops
+
+After `git push` from your laptop:
 
 ```bash
 ssh ubuntu@<vm-ip>
-cd /opt/baseball
-git pull
+cd /opt/baseball && git pull
 sudo systemctl restart mlb-api
 
-# Logs
-journalctl -u mlb-api -n 50 --no-pager      # recent output
-journalctl -u mlb-api -f                    # follow live
-sudo systemctl status mlb-api --no-pager    # is it running?
+# logs
+journalctl -u mlb-api -n 50 --no-pager      # recent
+journalctl -u mlb-api -f                    # follow
+sudo systemctl status mlb-api --no-pager
 ```
 
-**Deferred:** TLS and CORS for production. Plain HTTP on port 8000 is fine for API exploration and backend development. Before exposing a public frontend, wire up Caddy for TLS and add the production origin to `CORSMiddleware` in `backend/main.py`.
+**Deferred for prod.** Plain HTTP on port 8000 is fine for backend dev. Before a real public launch, wire up Caddy for TLS and add the production origin to `CORSMiddleware` in `backend/main.py`.
 
-## Project structure
+---
+
+## Development
+
+### Tests
+
+```bash
+pytest tests/ -v
+```
+
+### Lint / format
+
+```bash
+ruff check src/ tests/
+ruff format src/ tests/
+```
+
+### Configuration
+
+All settings in `.env` (copy from `.env.example`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BASEBALL_LOG_LEVEL` | `INFO` | loguru level |
+| `BASEBALL_DUCKDB_MEMORY_LIMIT` | unset | DuckDB memory cap (e.g. `4GB` on the 8 GB VM) |
+| `BASEBALL_DATA_ROOT` | `./data` | override data directory |
+
+---
+
+## Reference
+
+### Reports
+
+`reports/` is an archive of standalone one-off analyses, separate from the main pipeline. Currently one:
+
+- **First-pitch offspeed** (`reports/first_pitch_offspeed/`) — do hard throwers (96+ mph fastball) get more CSW% / whiffs leading at-bats with an offspeed pitch than soft throwers? Serves from frozen per-division Parquet in `data/legacy/` via the legacy `/api/first-pitch-offspeed/*` endpoints.
+
+### DuckDB for Postgres users
+
+Nearly everything transfers — CTEs, window functions, joins, aggregates, `CASE`, `EXTRACT()`, `DATE_TRUNC()`, identifier quoting, `||` concat. Differences:
+
+| Task | Postgres | DuckDB |
+|---|---|---|
+| List tables | `\dt` | `SHOW TABLES` (or `\dt` in `baseball shell`) |
+| Describe table | `\d table` | `DESCRIBE table` (or `\d table` in `baseball shell`) |
+| Connection | TCP to a server | Embedded — no server, no port |
+| Query a file | FDW / `COPY` | `SELECT * FROM read_parquet('*.parquet')` |
+
+DuckDB-only tricks worth stealing:
+
+- `SELECT * EXCLUDE (col_a, col_b) FROM t` — project everything except those.
+- `SELECT * REPLACE (CAST(x AS INT) AS x) FROM t` — swap a single column's value in place.
+- `read_parquet('dir/**/*.parquet', hive_partitioning=true)` — auto-extract `season=.../month=...` from paths.
+- `SUMMARIZE table` — one-liner descriptive stats across every column.
+
+Full docs: https://duckdb.org/docs/
+
+### Example validation queries
+
+```sql
+-- Pitch type distribution (regular season)
+SELECT pitch_type, COUNT(*) n, COUNT(*)*100.0/SUM(COUNT(*)) OVER () pct
+FROM pitches WHERE season=2024 AND game_type='R'
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Velo leaderboard, fastballs only, min 200 thrown
+SELECT player_name, AVG(release_speed) velo, COUNT(*) n
+FROM pitches
+WHERE season=2024 AND pitch_type IN ('FF','SI') AND release_speed IS NOT NULL
+GROUP BY player_name HAVING COUNT(*) > 200
+ORDER BY velo DESC LIMIT 20;
+
+-- Sanity: row counts by partition
+SELECT season, month, COUNT(*) n FROM pitches GROUP BY 1,2 ORDER BY 1,2;
+```
+
+### Project structure
 
 ```
 src/baseball/
-├── config.py               # paths, pydantic settings
+├── config.py               # paths, pydantic settings, shrinkage constants
 ├── cli.py                  # typer app (`baseball` entry point)
-├── ingest/
-│   ├── statcast.py         # chunked pybaseball pulls + partitioned writes
-│   └── backfill.py         # season iteration over ingest
-├── storage/
-│   └── duckdb_conn.py      # DuckDB connection factory + view registration
-├── derived/
-│   ├── _common.py          # shared helper: write_derived_parquet
-│   ├── pitcher_tables.py   # pitch_mix, zone_tendency, sequences_2pitch
-│   ├── batter_tables.py    # whiff_profile, swing_decisions, vs_sequences
-│   └── matchup_tables.py   # matchup_edges + matchup_edges_top view
+├── ingest/                 # chunked pybaseball pulls + partitioned writes
+├── storage/duckdb_conn.py  # connection factory + view registration
+├── derived/                # pitch_mix, zone_tendency, sequences, whiff_profile, matchup_edges
 └── jobs/
-    ├── rebuild_derived.py  # REGISTRY + rebuild orchestrator
-    └── daily_update.py     # cron entrypoint: ingest + rebuild
+    ├── rebuild_derived.py  # registry + orchestrator
+    └── daily_update.py     # cron entrypoint
 
-deploy/                     # systemd unit + crontab templates for VM install
-├── README.md
-├── crontab.example
-└── systemd/
-    ├── baseball-daily-update.service
-    └── baseball-daily-update.timer
+backend/                    # FastAPI — legacy /api/* + new /api/v2/*
+├── main.py
+└── v2/                     # sequences, matchup, lookups, player_names
 
-reports/                    # standalone analyses (see Reports section)
-backend/                    # legacy FastAPI
-frontend/                   # legacy React + Vite
+frontend/                   # Vite + React — analyzer pages + legacy report
+deploy/                     # systemd units + crontab templates for VM
+reports/                    # standalone one-off analyses
 tests/
 data/                       # gitignored (except data/legacy/)
 ```
