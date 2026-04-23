@@ -1,5 +1,5 @@
-altair
+fastapi
+uvicorn[standard]
 pandas
 pyarrow
 pybaseball
-streamlit
