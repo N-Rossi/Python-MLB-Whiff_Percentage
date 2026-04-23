@@ -12,7 +12,7 @@ Data infrastructure and analytics for MLB pitch-sequencing and pitcher/batter ma
 |---|---|
 | `baseball backfill` (ingest historical Statcast) | ✅ works |
 | `baseball update` (nightly in-season pull) | ✅ works |
-| `baseball rebuild-derived` | 🚧 stub |
+| `baseball rebuild-derived` | ✅ works (3 pitcher tables; batter/matchup pending) |
 | `baseball inspect` | ✅ works |
 | `baseball query` | ✅ works |
 | `baseball shell` (interactive SQL) | ✅ works |
@@ -86,13 +86,13 @@ data/
 │       ├── season=2025/
 │       └── .manifest.json              # completed-week tracker
 ├── derived/                            # rebuilt by `baseball rebuild-derived`
-│   ├── pitcher_pitch_mix.parquet
-│   ├── pitcher_zone_tendency.parquet
-│   ├── pitcher_sequences_2pitch.parquet
-│   ├── batter_whiff_profile.parquet
-│   ├── batter_swing_decisions.parquet
-│   ├── batter_vs_sequences.parquet
-│   └── matchup_edges.parquet
+│   ├── pitcher_pitch_mix.parquet              # ✅ built
+│   ├── pitcher_zone_tendency.parquet          # ✅ built
+│   ├── pitcher_sequences_2pitch.parquet       # ✅ built
+│   ├── batter_whiff_profile.parquet           # 🚧 pending
+│   ├── batter_swing_decisions.parquet         # 🚧 pending
+│   ├── batter_vs_sequences.parquet            # 🚧 pending
+│   └── matchup_edges.parquet                  # 🚧 pending
 └── legacy/                             # frozen data for the legacy report
     └── *_starters_2025_*.parquet
 ```
@@ -180,14 +180,31 @@ Commands:
 
 Command history and line editing work if the `readline` module is available (Unix default; on Windows install `pyreadline3` if you want arrow-key history).
 
-#### `baseball rebuild-derived` — 🚧 not yet implemented
+#### `baseball rebuild-derived` — build derived Parquet tables
 
-Will rebuild all derived Parquet tables from raw pitch data once the derived layer lands:
+Aggregates the raw `pitches` into queryable summary tables under `data/derived/`. Each table is auto-registered as a view in subsequent `baseball query` / `baseball shell` sessions.
 
 ```bash
-baseball rebuild-derived
-baseball rebuild-derived --table pitcher_pitch_mix
+baseball rebuild-derived                                 # all tables in the registry
+baseball rebuild-derived --table pitcher_pitch_mix        # just one
 ```
+
+Current pitcher tables (regular season only):
+
+| Table | Key | Rows (2024) | What it answers |
+|---|---|---|---|
+| `pitcher_pitch_mix` | `(pitcher, season, balls, strikes, pitch_type)` | 35k | How often does this pitcher throw this pitch type in this count? |
+| `pitcher_zone_tendency` | `(pitcher, season, pitch_type, balls, strikes, zone)` | 206k | Where does this pitcher locate this pitch type in this count? |
+| `pitcher_sequences_2pitch` | `(pitcher, season, balls_before_p1, strikes_before_p1, pitch1_type, pitch2_type)` | 93k | When this pitcher throws pitch X → pitch Y, what's the whiff rate and put-away rate on pitch Y? |
+
+Every rate column ships in three flavors:
+- **`_raw`** — empirical rate from the pitcher's sample
+- **`league_*`** — the league rate for the same bucket (same count, same pitch type, etc.)
+- **`_shrunk`** — empirical-Bayes blend of raw toward league, tuned per metric in `config.SHRINKAGE_K`
+
+Every table also carries an explicit sample-size column (`pitch_count`, `zone_count`, `n_sequences`) so consumers can apply their own minimum thresholds. See `SAMPLE_SIZES.md` for recommended cutoffs.
+
+Batter tables (`batter_whiff_profile`, `batter_swing_decisions`, `batter_vs_sequences`) and the cross-joined `matchup_edges` table are coming next.
 
 ### DuckDB for Postgres users
 
@@ -305,8 +322,11 @@ src/baseball/
 │   └── backfill.py         # season iteration over ingest
 ├── storage/
 │   └── duckdb_conn.py      # DuckDB connection factory + view registration
-├── derived/                # (stub) pitcher / batter / matchup tables
-└── jobs/                   # (stub) cron entrypoints
+├── derived/
+│   ├── _common.py          # shared helper: write_derived_parquet
+│   └── pitcher_tables.py   # pitch_mix, zone_tendency, sequences_2pitch
+└── jobs/
+    └── rebuild_derived.py  # REGISTRY + rebuild orchestrator
 
 reports/                    # standalone analyses (see Reports section)
 backend/                    # legacy FastAPI

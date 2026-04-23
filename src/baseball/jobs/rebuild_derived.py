@@ -7,13 +7,19 @@ from typing import Callable
 import duckdb
 from loguru import logger
 
-from baseball.derived.pitcher_tables import build_pitcher_pitch_mix
+from baseball.derived.pitcher_tables import (
+    build_pitcher_pitch_mix,
+    build_pitcher_sequences_2pitch,
+    build_pitcher_zone_tendency,
+)
 from baseball.storage.duckdb_conn import get_connection, register_views
 
 # Order matters once tables start depending on one another (e.g., matchup_edges
-# joins pitcher and batter tables). For now there's only one.
+# joins pitcher and batter tables). The current tables are independent.
 REGISTRY: dict[str, Callable[[duckdb.DuckDBPyConnection], None]] = {
     "pitcher_pitch_mix": build_pitcher_pitch_mix,
+    "pitcher_zone_tendency": build_pitcher_zone_tendency,
+    "pitcher_sequences_2pitch": build_pitcher_sequences_2pitch,
 }
 
 

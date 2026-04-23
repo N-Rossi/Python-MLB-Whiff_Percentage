@@ -19,6 +19,9 @@ REGULAR_SEASON_END_MMDD = "11-30"
 # See SAMPLE_SIZES.md for per-metric motivation.
 SHRINKAGE_K: dict[str, int] = {
     "pitch_mix": 20,
+    "zone_tendency": 30,
+    "whiff_rate_seq": 50,
+    "put_away_rate_seq": 40,
 }
 
 

@@ -3,7 +3,11 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from baseball.derived.pitcher_tables import build_pitcher_pitch_mix
+from baseball.derived.pitcher_tables import (
+    build_pitcher_pitch_mix,
+    build_pitcher_sequences_2pitch,
+    build_pitcher_zone_tendency,
+)
 from baseball.jobs.rebuild_derived import REGISTRY, rebuild_one
 from baseball.storage.duckdb_conn import get_connection, register_views
 
@@ -152,3 +156,274 @@ def test_rebuild_derived_cli_unknown_table(data_root_with_pitches):
     result = runner.invoke(app, ["rebuild-derived", "--table", "does_not_exist"])
     assert result.exit_code != 0
     assert "Unknown table" in result.output
+
+
+# ---------------------------------------------------------------------------
+# pitcher_zone_tendency
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_pitches_for_zones(isolated_data_root):
+    """Two pitchers, mirror-image zone distributions on FF in 0-0.
+
+    Pitcher 100: 8 FF in zone=5, 2 FF in zone=11 (heart-heavy)
+    Pitcher 200: 2 FF in zone=5, 8 FF in zone=11 (edge-heavy)
+
+    League for (FF, 0-0):  zone=5: 10, zone=11: 10, total=20
+      league_pct(z=5) = league_pct(z=11) = 0.5
+
+    With k=30:
+      100/z=5:  (8 + 30*0.5) / (10 + 30) = 23/40 = 0.575
+      100/z=11: (2 + 15) / 40 = 17/40 = 0.425
+      200/z=5:  (2 + 15) / 40 = 17/40 = 0.425
+      200/z=11: (8 + 15) / 40 = 23/40 = 0.575
+    """
+    rows = []
+    for _ in range(8):
+        rows.append(_zone_row(100, "A", "FF", 5))
+    for _ in range(2):
+        rows.append(_zone_row(100, "A", "FF", 11))
+    for _ in range(2):
+        rows.append(_zone_row(200, "B", "FF", 5))
+    for _ in range(8):
+        rows.append(_zone_row(200, "B", "FF", 11))
+    # NULL zone should be dropped.
+    rows.append({**_zone_row(100, "A", "FF", 5), "zone": None})
+
+    df = pd.DataFrame(rows)
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    for col in ("pitcher", "batter", "game_pk", "balls", "strikes", "zone"):
+        df[col] = df[col].astype("Int64")
+
+    part = isolated_data_root / "raw" / "statcast" / "season=2024" / "month=04"
+    part.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(part / "pitches.parquet", compression="zstd", index=False)
+    return isolated_data_root
+
+
+def _zone_row(pitcher: int, name: str, pitch_type: str, zone: int | None) -> dict:
+    return {
+        "pitcher": pitcher,
+        "batter": 999,
+        "player_name": name,
+        "game_date": "2024-04-01",
+        "game_pk": 1,
+        "game_type": "R",
+        "balls": 0,
+        "strikes": 0,
+        "pitch_type": pitch_type,
+        "zone": zone,
+        "p_throws": "R",
+    }
+
+
+def test_pitcher_zone_tendency_row_count(synthetic_pitches_for_zones):
+    con = get_connection()
+    register_views(con)
+    build_pitcher_zone_tendency(con)
+
+    result = pd.read_parquet(
+        synthetic_pitches_for_zones / "derived" / "pitcher_zone_tendency.parquet"
+    )
+    # 4 rows: 2 pitchers × 2 zones each
+    assert len(result) == 4
+
+
+def test_pitcher_zone_tendency_shrinkage_math(synthetic_pitches_for_zones):
+    con = get_connection()
+    register_views(con)
+    build_pitcher_zone_tendency(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_zones / "derived" / "pitcher_zone_tendency.parquet"
+    ).set_index(["pitcher", "zone"])
+
+    # Mirror-image shrinkage:
+    assert r.loc[(100, 5), "pct_raw"] == pytest.approx(0.8)
+    assert r.loc[(100, 5), "pct_shrunk"] == pytest.approx(0.575)
+    assert r.loc[(200, 5), "pct_shrunk"] == pytest.approx(0.425)
+    assert r.loc[(100, 11), "pct_shrunk"] == pytest.approx(0.425)
+    assert r.loc[(200, 11), "pct_shrunk"] == pytest.approx(0.575)
+
+
+# ---------------------------------------------------------------------------
+# pitcher_sequences_2pitch
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def synthetic_pitches_for_sequences(isolated_data_root):
+    """Craft four plate appearances with known 2-pitch sequences.
+
+    Pitcher 100 (Ace) throws FF→CH at (0,1) four times:
+      PA1: FF(0-1) → CH(0-2, swinging_strike, strikeout)   # whiff + put_away
+      PA2: FF(0-1) → CH(0-2, foul)                         # swing, not whiff
+      PA3: FF(0-1) → CH(0-2, swinging_strike, strikeout)   # whiff + put_away
+      PA4: FF(0-1) → CH(0-2, called_strike)                # no swing
+    Pitcher 100 aggregate (FF→CH @ 0-1):
+      n=4, swings=3, whiffs=2, two_strike_p2=4, put_aways=2
+      whiff_rate_raw = 2/3 ≈ 0.6667
+      put_away_rate_raw = 2/4 = 0.5
+
+    Pitcher 200 (Avg) throws FF→CH at (0,1) twice:
+      PA5: FF(0-1) → CH(0-2, ball)               # no swing
+      PA6: FF(0-1) → CH(0-2, hit_into_play)      # swing, not whiff
+    Pitcher 200 aggregate:
+      n=2, swings=1, whiffs=0, two_strike_p2=2, put_aways=0
+      whiff_rate_raw = 0/1 = 0.0
+      put_away_rate_raw = 0/2 = 0.0
+
+    League FF→CH @ (0,1):
+      n=6, swings=4, whiffs=2, two_strike=6, put_aways=2
+      league_whiff_rate = 2/4 = 0.5
+      league_put_away_rate = 2/6 ≈ 0.3333
+
+    Expected shrunk (k_whiff=50, k_pa=40):
+      Pitcher 100 whiff_rate_shrunk = (2 + 50*0.5) / (3 + 50) = 27/53 ≈ 0.5094
+      Pitcher 100 put_away_rate_shrunk = (2 + 40*0.3333) / (4 + 40) = 15.333/44 ≈ 0.3485
+    """
+    rows = []
+    pa_id = 0
+    for outcome in [
+        ("swinging_strike", "strikeout"),
+        ("foul", None),
+        ("swinging_strike", "strikeout"),
+        ("called_strike", None),
+    ]:
+        pa_id += 1
+        rows.append(_seq_row(100, "Ace", pa_id, 1, "FF", 0, 1, "called_strike", None))
+        rows.append(_seq_row(100, "Ace", pa_id, 2, "CH", 0, 2, *outcome))
+
+    for outcome in [("ball", None), ("hit_into_play", None)]:
+        pa_id += 1
+        rows.append(_seq_row(200, "Avg", pa_id, 1, "FF", 0, 1, "called_strike", None))
+        rows.append(_seq_row(200, "Avg", pa_id, 2, "CH", 0, 2, *outcome))
+
+    df = pd.DataFrame(rows)
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    for col in ("pitcher", "batter", "game_pk", "at_bat_number", "pitch_number",
+                "balls", "strikes"):
+        df[col] = df[col].astype("Int64")
+
+    part = isolated_data_root / "raw" / "statcast" / "season=2024" / "month=04"
+    part.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(part / "pitches.parquet", compression="zstd", index=False)
+    return isolated_data_root
+
+
+def _seq_row(
+    pitcher: int, name: str, ab: int, pn: int, pitch_type: str,
+    balls: int, strikes: int, description: str, events: str | None,
+) -> dict:
+    return {
+        "pitcher": pitcher,
+        "batter": 999,
+        "player_name": name,
+        "game_date": "2024-04-01",
+        "game_pk": 1,
+        "at_bat_number": ab,
+        "pitch_number": pn,
+        "game_type": "R",
+        "pitch_type": pitch_type,
+        "balls": balls,
+        "strikes": strikes,
+        "description": description,
+        "events": events,
+        "p_throws": "R",
+    }
+
+
+def test_sequences_row_count_and_keys(synthetic_pitches_for_sequences):
+    con = get_connection()
+    register_views(con)
+    build_pitcher_sequences_2pitch(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_sequences / "derived" / "pitcher_sequences_2pitch.parquet"
+    )
+    # 2 rows: (100, FF→CH @ 0-1) and (200, FF→CH @ 0-1)
+    assert len(r) == 2
+    assert set(r["pitch1_type"]) == {"FF"}
+    assert set(r["pitch2_type"]) == {"CH"}
+    assert set(r["balls_before_p1"]) == {0}
+    assert set(r["strikes_before_p1"]) == {1}
+
+
+def test_sequences_counts_for_ace(synthetic_pitches_for_sequences):
+    con = get_connection()
+    register_views(con)
+    build_pitcher_sequences_2pitch(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_sequences / "derived" / "pitcher_sequences_2pitch.parquet"
+    ).set_index("pitcher")
+
+    assert r.loc[100, "n_sequences"] == 4
+    assert r.loc[100, "swings_on_p2"] == 3
+    assert r.loc[100, "whiffs_on_p2"] == 2
+    assert r.loc[100, "two_strike_p2"] == 4
+    assert r.loc[100, "put_aways"] == 2
+    assert r.loc[100, "whiff_rate_raw"] == pytest.approx(2 / 3)
+    assert r.loc[100, "put_away_rate_raw"] == pytest.approx(0.5)
+
+
+def test_sequences_league_rates(synthetic_pitches_for_sequences):
+    con = get_connection()
+    register_views(con)
+    build_pitcher_sequences_2pitch(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_sequences / "derived" / "pitcher_sequences_2pitch.parquet"
+    )
+    # League rates are identical across rows with same sequence key.
+    whiff_uniq = r["league_whiff_rate"].unique()
+    pa_uniq = r["league_put_away_rate"].unique()
+    assert len(whiff_uniq) == 1 and whiff_uniq[0] == pytest.approx(0.5)
+    assert len(pa_uniq) == 1 and pa_uniq[0] == pytest.approx(2 / 6)
+
+
+def test_sequences_shrinkage_hand_computed(synthetic_pitches_for_sequences):
+    con = get_connection()
+    register_views(con)
+    build_pitcher_sequences_2pitch(con)
+
+    r = pd.read_parquet(
+        synthetic_pitches_for_sequences / "derived" / "pitcher_sequences_2pitch.parquet"
+    ).set_index("pitcher")
+
+    # whiff_rate_shrunk (k=50): (2 + 50*0.5) / (3 + 50) = 27/53
+    assert r.loc[100, "whiff_rate_shrunk"] == pytest.approx(27 / 53)
+    # put_away_rate_shrunk (k=40): (2 + 40*(2/6)) / (4 + 40) = (2 + 40/3) / 44
+    expected_pa = (2 + 40 * (2 / 6)) / 44
+    assert r.loc[100, "put_away_rate_shrunk"] == pytest.approx(expected_pa)
+
+
+def test_sequences_lag_does_not_cross_plate_appearances(isolated_data_root):
+    """Ensure LAG window is scoped to (game_pk, at_bat_number). A pitch at the
+    start of PA 2 must NOT see the last pitch of PA 1 as its predecessor."""
+    rows = [
+        # PA 1: single pitch
+        _seq_row(100, "A", 1, 1, "FF", 0, 0, "called_strike", None),
+        # PA 2: single pitch — must not chain off the FF from PA 1
+        _seq_row(100, "A", 2, 1, "SL", 0, 0, "ball", None),
+    ]
+    df = pd.DataFrame(rows)
+    df["game_date"] = pd.to_datetime(df["game_date"])
+    for col in ("pitcher", "batter", "game_pk", "at_bat_number", "pitch_number",
+                "balls", "strikes"):
+        df[col] = df[col].astype("Int64")
+
+    part = isolated_data_root / "raw" / "statcast" / "season=2024" / "month=04"
+    part.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(part / "pitches.parquet", compression="zstd", index=False)
+
+    con = get_connection()
+    register_views(con)
+    build_pitcher_sequences_2pitch(con)
+
+    r = pd.read_parquet(
+        isolated_data_root / "derived" / "pitcher_sequences_2pitch.parquet"
+    )
+    # No sequences should be produced: each PA had only one pitch.
+    assert len(r) == 0
