@@ -140,6 +140,22 @@ def test_matchup_top_edges_respects_sample_floors(client):
         assert row["batter_swings"] >= 30
 
 
+def test_matchup_perspective_flips_sort(client):
+    """pitcher-perspective top row should have the highest edge_weighted;
+    batter-perspective top row should have the lowest (most negative)."""
+    seasons = client.get("/api/v2/seasons").json()["seasons"]
+    base = (
+        f"/api/v2/matchup/edges/top?season={seasons[0]}"
+        f"&min_pitcher_n=50&min_batter_swings=30&limit=5"
+    )
+    pitch = client.get(base + "&perspective=pitcher").json()["rows"]
+    bat = client.get(base + "&perspective=batter").json()["rows"]
+    assert pitch and bat
+    # If both lists have a weighted value, pitcher's #1 should be ≥ batter's #1
+    if pitch[0]["edge_weighted"] is not None and bat[0]["edge_weighted"] is not None:
+        assert pitch[0]["edge_weighted"] >= bat[0]["edge_weighted"]
+
+
 def test_matchup_pairing_nonexistent_returns_404(client):
     r = client.get("/api/v2/matchup/pairing/669373/999999?season=2024")
     assert r.status_code == 404

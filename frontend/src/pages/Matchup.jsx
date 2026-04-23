@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import EdgeTable from "../components/EdgeTable.jsx";
 import Metric from "../components/Metric.jsx";
 import PlayerCombo from "../components/PlayerCombo.jsx";
@@ -24,6 +24,7 @@ export default function Matchup() {
   const [season, setSeason] = useState(null);
   const [pitcher, setPitcher] = useState(null);
   const [batter, setBatter] = useState(null);
+  const [perspective, setPerspective] = useState("pitcher"); // "pitcher" | "batter"
 
   const [minPitcherN, setMinPitcherN] = useState(0);
   const [minBatterSwings, setMinBatterSwings] = useState(0);
@@ -46,6 +47,10 @@ export default function Matchup() {
   // Fetch when both players chosen -> pairing card; otherwise fetch a
   // league-wide top edges preview so the page isn't empty while the user
   // is making selections.
+  //
+  // `perspective` only triggers a refetch for the league-wide preview since
+  // server-side sort depends on it. For the pairing view, sorting is
+  // done client-side in a memo — no refetch needed when the toggle flips.
   const debRef = useRef();
   useEffect(() => {
     if (!season) return;
@@ -53,7 +58,7 @@ export default function Matchup() {
     debRef.current = setTimeout(() => runQuery(), 200);
     return () => clearTimeout(debRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [season, pitcher, batter, minPitcherN, minBatterSwings]);
+  }, [season, pitcher, batter, minPitcherN, minBatterSwings, perspective]);
 
   function runQuery() {
     setError(null);
@@ -81,6 +86,7 @@ export default function Matchup() {
         batter_id: batter?.id,
         min_pitcher_n: Math.max(minPitcherN, 50),
         min_batter_swings: Math.max(minBatterSwings, 30),
+        perspective,
         limit: 50,
       })
         .then((d) => setTopEdges(d.rows))
@@ -92,6 +98,26 @@ export default function Matchup() {
     }
   }
 
+  // Client-side sort of pairing edges so the perspective toggle is instant —
+  // no refetch, no network. DESC for pitcher (most leverage first), ASC for
+  // batter (most-negative weighted first = where batter whiffs least vs
+  // league, weighted by pitcher usage).
+  const sortedPairingEdges = useMemo(() => {
+    if (!pairing?.edges) return [];
+    const arr = [...pairing.edges];
+    arr.sort((a, b) => {
+      const av = a.edge_weighted;
+      const bv = b.edge_weighted;
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return perspective === "batter" ? av - bv : bv - av;
+    });
+    return arr;
+  }, [pairing, perspective]);
+
+  const topThree = sortedPairingEdges.slice(0, 3);
+
   if (bootError) {
     return <div className="error">Failed to load API metadata: {bootError}</div>;
   }
@@ -100,6 +126,10 @@ export default function Matchup() {
   const lowerSampleFloor = !pitcher || !batter
     ? "Default floors (pitcher_n≥50, batter_swings≥30) while browsing; drop them in sidebar for less-common pairs."
     : null;
+
+  const perspectiveHint = perspective === "pitcher"
+    ? "Sorted by highest leverage for the pitcher (edge_weighted DESC)."
+    : "Sorted by batter's best spots — pitches thrown often where the batter whiffs LESS than league.";
 
   return (
     <div className="layout">
@@ -126,6 +156,27 @@ export default function Matchup() {
           onChange={setBatter}
           fetchPlayers={(q) => searchBatters({ season, q, limit: 20 })}
         />
+
+        <label>Perspective</label>
+        <div className="radio-row">
+          {[
+            ["pitcher", "Pitcher"],
+            ["batter", "Batter"],
+          ].map(([v, l]) => (
+            <button
+              key={v}
+              type="button"
+              className={perspective === v ? "active" : ""}
+              onClick={() => setPerspective(v)}
+            >
+              {l}
+            </button>
+          ))}
+        </div>
+        <div className="caption" style={{ marginTop: 4 }}>
+          Whose best edges are we looking for? Pitcher = highest leverage;
+          Batter = spots with lowest whiff rate vs league.
+        </div>
 
         <h3>Sample-size floors</h3>
         <div className="caption">
@@ -164,27 +215,42 @@ export default function Matchup() {
               {pairing.player_name ?? `id:${pairing.pitcher}`} vs{" "}
               {pairing.batter_name ?? `id:${pairing.batter}`} — {pairing.season}
             </h2>
+            <div className="caption">
+              Perspective: <strong>{perspective}</strong>. {perspectiveHint}
+            </div>
             <div className="metrics">
               <Metric
-                label="Best edge"
+                label={
+                  perspective === "pitcher" ? "Best edge (pitcher)" : "Best spot (batter)"
+                }
                 value={
-                  pairing.best_pitch_type
-                    ? `${pairing.best_pitch_type} in ${pairing.best_balls}-${pairing.best_strikes}`
+                  topThree[0]
+                    ? `${topThree[0].pitch_type} in ${topThree[0].balls}-${topThree[0].strikes}`
                     : "—"
                 }
-                help={`Weighted ${fmtWeighted(
-                  pairing.best_edge_weighted
-                )} · Lift ${fmtLiftPP(pairing.best_edge_lift)}`}
+                help={
+                  topThree[0]
+                    ? `Weighted ${fmtWeighted(topThree[0].edge_weighted)} · Lift ${fmtLiftPP(topThree[0].edge_lift)}`
+                    : ""
+                }
               />
               <Metric
-                label="2nd edge"
-                value={pairing.second_pitch_type ?? "—"}
-                help={`Weighted ${fmtWeighted(pairing.second_edge_weighted)}`}
+                label="2nd"
+                value={
+                  topThree[1]
+                    ? `${topThree[1].pitch_type} in ${topThree[1].balls}-${topThree[1].strikes}`
+                    : "—"
+                }
+                help={topThree[1] ? `Weighted ${fmtWeighted(topThree[1].edge_weighted)}` : ""}
               />
               <Metric
-                label="3rd edge"
-                value={pairing.third_pitch_type ?? "—"}
-                help={`Weighted ${fmtWeighted(pairing.third_edge_weighted)}`}
+                label="3rd"
+                value={
+                  topThree[2]
+                    ? `${topThree[2].pitch_type} in ${topThree[2].balls}-${topThree[2].strikes}`
+                    : "—"
+                }
+                help={topThree[2] ? `Weighted ${fmtWeighted(topThree[2].edge_weighted)}` : ""}
               />
               <Metric
                 label="Edge cells"
@@ -202,20 +268,23 @@ export default function Matchup() {
 
             <h2>All edges in this matchup</h2>
             <div className="caption">
-              Sorted by <code>Weighted</code>. Weighted = Pitcher% × Lift,
-              scaled by 1000 for readability.
+              {perspectiveHint} Weighted = Pitcher% × Lift, scaled by 1000. Green
+              cells = pitcher advantage; red = batter advantage (colors don't
+              flip with perspective — they always show who wins the pitch).
             </div>
-            <EdgeTable rows={pairing.edges} />
+            <EdgeTable rows={sortedPairingEdges} />
           </>
         )}
 
         {!pairing && topEdges && (
           <>
             <h2 style={{ marginTop: 20 }}>
-              Top league edges · {season}
+              Top league edges · {season} ·{" "}
+              {perspective === "pitcher" ? "Pitcher perspective" : "Batter perspective"}
               {pitcher && ` · ${pitcher.name}`}
               {batter && ` · ${batter.name}`}
             </h2>
+            <div className="caption">{perspectiveHint}</div>
             {lowerSampleFloor && (
               <div className="caption">{lowerSampleFloor}</div>
             )}

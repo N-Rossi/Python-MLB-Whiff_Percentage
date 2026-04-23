@@ -114,12 +114,28 @@ def matchup_pairing(
 # --- Top edges (general-purpose leaderboard) -------------------------------
 
 TOP_SORT_COLS = {
-    "edge_weighted": "edge_weighted DESC NULLS LAST",
-    "edge_lift": "edge_lift DESC NULLS LAST",
-    "batter_whiff_shrunk": "batter_whiff_shrunk DESC NULLS LAST",
-    "pitcher_n": "pitcher_n DESC",
-    "batter_swings": "batter_swings DESC",
+    "edge_weighted": "edge_weighted",
+    "edge_lift": "edge_lift",
+    "batter_whiff_shrunk": "batter_whiff_shrunk",
+    "pitcher_n": "pitcher_n",
+    "batter_swings": "batter_swings",
 }
+
+
+def _top_edges_order_by(sort: str, perspective: str) -> str:
+    """Build the ORDER BY for /matchup/edges/top.
+
+    - pitcher perspective: DESC (pitcher's biggest leverage first)
+    - batter perspective:  ASC  (most negative weighted first — where the
+      batter whiffs less than league, weighted by how often the pitcher
+      throws it there). Sample-size columns (pitcher_n, batter_swings)
+      always sort DESC regardless — "biggest sample" is perspective-neutral.
+    """
+    col = TOP_SORT_COLS[sort]
+    if sort in ("pitcher_n", "batter_swings"):
+        return f"{col} DESC"
+    direction = "ASC" if perspective == "batter" else "DESC"
+    return f"{col} {direction} NULLS LAST"
 
 
 class EdgesTopResponse(BaseModel):
@@ -137,6 +153,17 @@ def top_edges(
     min_pitcher_n: int = Query(DEFAULT_MIN_PITCHER_N, ge=0),
     min_batter_swings: int = Query(DEFAULT_MIN_BATTER_SWINGS, ge=0),
     sort: str = Query("edge_weighted", description=f"One of: {list(TOP_SORT_COLS)}"),
+    perspective: str = Query(
+        "pitcher",
+        pattern="^(pitcher|batter)$",
+        description=(
+            "'pitcher' surfaces the pitcher's highest-leverage pitches "
+            "(edge_weighted DESC). 'batter' surfaces the batter's best "
+            "spots — pitches thrown often where the batter whiffs less "
+            "than league (edge_weighted ASC). Sample-size sorts are "
+            "unaffected."
+        ),
+    ),
     limit: int = Query(50, ge=1, le=500),
     con=CursorDep,
 ):
@@ -173,7 +200,7 @@ def top_edges(
         SELECT {", ".join(_EDGE_COLS)}
         FROM matchup_edges
         WHERE {where}
-        ORDER BY {TOP_SORT_COLS[sort]}
+        ORDER BY {_top_edges_order_by(sort, perspective)}
         LIMIT ?
         """,
         params + [limit],
