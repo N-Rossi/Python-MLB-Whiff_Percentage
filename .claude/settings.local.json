@@ -32,7 +32,12 @@
       "Bash(awk '{print $5, $9}')",
       "Bash(awk 'NR>2 {printf \"%-40s %10s bytes\\\\n\", $9, $5}')",
       "Bash(.venv/Scripts/baseball daily-update *)",
-      "Bash(.venv/Scripts/python.exe *)"
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(npm run *)",
+      "Bash(curl -s http://localhost:5173/)",
+      "Bash(curl -s http://localhost:5173/src/App.jsx)",
+      "Read(//tmp/**)",
+      "Bash(wait echo *)"
     ]
   }
 }

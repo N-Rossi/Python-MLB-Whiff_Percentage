@@ -45,11 +45,31 @@ a:hover {
   padding: 10px 20px;
   background: var(--bg-alt);
   border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 20px;
 }
 .brand {
   font-weight: 600;
   font-size: 16px;
   color: var(--text);
+}
+.topnav {
+  display: flex;
+  gap: 16px;
+}
+.topnav a {
+  color: var(--text-muted);
+  font-size: 14px;
+  padding: 4px 0;
+  border-bottom: 2px solid transparent;
+}
+.topnav a:hover {
+  color: var(--text);
+}
+.topnav a.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
 }
 
 .main {
@@ -343,4 +363,100 @@ tr:hover td {
   color: var(--text-muted);
   padding: 20px;
   text-align: center;
+}
+
+/* Player typeahead combobox */
+.combo {
+  position: relative;
+  margin-top: 10px;
+}
+.combo label {
+  display: block;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.combo-input-wrap {
+  position: relative;
+}
+.combo-input-wrap input {
+  width: 100%;
+  padding: 6px 28px 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 13px;
+}
+.combo-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 6px;
+}
+.combo-clear:hover {
+  color: var(--text);
+}
+.combo-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 2px;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  z-index: 10;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+.combo-option {
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.combo-option:hover,
+.combo-option.active {
+  background: var(--accent);
+  color: white;
+}
+.combo-loading {
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Required-field marker */
+.req {
+  color: #ff7b7b;
+  margin-left: 2px;
+}
+
+/* Lift-colored table cells (gain vs league = green, loss = red) */
+.lift-pos {
+  color: #7bd389;
+}
+.lift-pos-strong {
+  color: #7bd389;
+  font-weight: 600;
+}
+.lift-neg {
+  color: #e08585;
+}
+.lift-neg-strong {
+  color: #e08585;
+  font-weight: 600;
+}
+
+/* Emphasize the leverage column in the edge table */
+.weighted-col {
+  font-weight: 600;
+  color: var(--text);
 }
