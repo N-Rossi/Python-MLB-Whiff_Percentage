@@ -76,7 +76,7 @@ Open two terminals.
 **Terminal 1 — backend:**
 
 ```bash
-uvicorn backend.main:app --reload --port 8000
+python -m uvicorn backend.main:app --reload --port 8000
 ```
 
 API will be on http://localhost:8000 (interactive docs at
