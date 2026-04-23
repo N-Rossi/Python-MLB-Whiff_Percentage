@@ -7,7 +7,27 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('reports/first_pitch_offspeed/analyze.py'\\).read\\(\\)\\); ast.parse\\(open\\('reports/first_pitch_offspeed/page.py'\\).read\\(\\)\\); print\\('OK: both files parse'\\)\")",
       "Bash(python -m reports.first_pitch_offspeed.analyze)",
       "Bash(python3 *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(git rm *)",
+      "Bash(mkdir -p data/legacy src/baseball/ingest src/baseball/storage src/baseball/derived src/baseball/jobs tests)",
+      "Bash(git mv *)",
+      "Bash(.venv/Scripts/python -m pip install --upgrade pip --quiet)",
+      "Bash(.venv/Scripts/python -m pip install pandas pyarrow \"pydantic>=2.6\" \"pydantic-settings>=2.2\" loguru typer pytest --quiet)",
+      "Bash(.venv/Scripts/python -m pip install -e . --no-deps --quiet)",
+      "Bash(.venv/Scripts/python -c \"from baseball.ingest.statcast import iter_weeks, coerce_types; print\\('import ok'\\)\")",
+      "Bash(.venv/Scripts/python -m pytest tests/test_ingest.py -v)",
+      "Bash(.venv/Scripts/baseball --help)",
+      "Bash(.venv/Scripts/python -c \"from reports.first_pitch_offspeed.analyze import available_divisions; print\\('legacy divisions:', available_divisions\\(\\)\\)\")",
+      "Bash(.venv/Scripts/python -m pip install pybaseball --quiet)",
+      "Bash(.venv/Scripts/python -c \"import pybaseball; print\\('pybaseball', pybaseball.__version__\\)\")",
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Bash(.venv/Scripts/python *)",
+      "Bash(.venv/Scripts/baseball backfill *)",
+      "Bash(tee /tmp/backfill-2024.log)",
+      "Bash(.venv/Scripts/baseball query *)",
+      "Bash(.venv/Scripts/baseball inspect *)",
+      "Bash(printf '\\\\\\\\dt\\\\nSELECT pitch_type, COUNT\\(*\\) AS n FROM pitches WHERE season=2024 AND game_type=%s GROUP BY 1 ORDER BY 2 DESC LIMIT 5;\\\\n\\\\\\\\q\\\\n' \"'R'\")",
+      "Bash(.venv/Scripts/baseball shell *)"
     ]
   }
 }

@@ -13,7 +13,7 @@ import re
 import numpy as np
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "legacy"
 PITCHES_GLOB = "*_starters_*_pitches.parquet"
 
 # Statcast pitch_type codes
