@@ -1,0 +1,31 @@
+[Unit]
+Description=Baseball analytics daily Statcast update
+Documentation=https://github.com/N-Rossi/Python-MLB-Whiff_Percentage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Adjust User / WorkingDirectory to match your install.
+User=baseball
+Group=baseball
+WorkingDirectory=/opt/baseball
+
+# Logging — file logs rotate for 30 days; journalctl also captures everything.
+Environment=BASEBALL_LOG_LEVEL=INFO
+Environment=BASEBALL_DAILY_LOG_DIR=/var/log/baseball
+# Optional: cap DuckDB memory on the 8 GB VM so the rebuild can't OOM us.
+Environment=BASEBALL_DUCKDB_MEMORY_LIMIT=4GB
+
+# --days 2 gives a one-day catch-up cushion without slowing the happy path
+# (already-cached days are skipped via the manifest).
+ExecStart=/opt/baseball/.venv/bin/baseball daily-update --days 2
+
+# Retry once on failure — a Savant blip shouldn't silently drop a day.
+Restart=on-failure
+RestartSec=5min
+
+# Reasonable limits.
+TimeoutStartSec=30min
+Nice=10

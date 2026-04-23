@@ -4,22 +4,25 @@ FastAPI backend for MLB Pitch Analytics.
 Run from project root:
     uvicorn backend.main:app --reload --port 8000
 
-Endpoints:
+Legacy endpoints (first-pitch offspeed report):
     GET  /api/reports                              -> report catalog (home page)
     GET  /api/divisions                            -> cached divisions on disk
     GET  /api/first-pitch-offspeed/meta            -> pitch-type labels, constants
     POST /api/first-pitch-offspeed/compute         -> full result payload
 
-The heavy lifting stays in reports/first_pitch_offspeed/analyze.py — this file
-is a thin HTTP shell over it.
+v2 endpoints over the Phase 1 derived tables live in `backend.v2` — see the
+module docstrings there. All v2 routes are prefixed with `/api/v2`.
 """
 
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from backend.v2 import router as v2_router
+from backend.v2.db import close_connection, init_connection
 from reports.first_pitch_offspeed.analyze import (
     compute,
     available_divisions,
@@ -30,7 +33,17 @@ from reports.first_pitch_offspeed.analyze import (
 )
 
 
-app = FastAPI(title="MLB Pitch Analytics API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_connection()
+    try:
+        yield
+    finally:
+        close_connection()
+
+
+app = FastAPI(title="MLB Pitch Analytics API", lifespan=lifespan)
+app.include_router(v2_router)
 
 app.add_middleware(
     CORSMiddleware,
