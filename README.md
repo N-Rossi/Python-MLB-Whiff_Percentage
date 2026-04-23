@@ -50,10 +50,10 @@ python fetch_starters.py all          # every division
 Valid divisions: `al_east`, `al_central`, `al_west`, `nl_east`, `nl_central`,
 `nl_west`.
 
-Each run writes two CSVs per division into `data/`:
+Each run writes two Parquet files per division into `data/`:
 
-- `data/{division}_starters_2025_roster.csv` — one row per starting pitcher
-- `data/{division}_starters_2025_pitches.csv` — one row per pitch
+- `data/{division}_starters_2025_roster.parquet` — one row per starting pitcher
+- `data/{division}_starters_2025_pitches.parquet` — one row per pitch
 
 All reports read from `data/`, so a single fetch feeds every analysis.
 Statcast pulls can take several minutes per division. `pybaseball`'s cache is
