@@ -301,9 +301,43 @@ GROUP BY 1 ORDER BY 1;
 SELECT season, month, COUNT(*) AS n FROM pitches GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
+## API (v2)
+
+All endpoints for the sequence analyzer and matchup-edges UI live under `/api/v2/*` in `backend/v2/`. They read the derived Parquet via a single long-lived DuckDB connection opened at app startup. No caching layer — DuckDB over Parquet is already sub-100ms for these queries.
+
+Interactive docs: `http://localhost:8000/docs` (dev) or `http://<vm-ip>:8000/docs` (deployed).
+
+### Lookup endpoints (dropdowns)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v2/seasons` | seasons with derived data, newest first |
+| `GET /api/v2/pitch-types` | pitch-type codes + human labels |
+| `GET /api/v2/pitchers?season&q&limit` | type-ahead pitcher search |
+| `GET /api/v2/batters?season&q&limit` | type-ahead batter search (Chadwick-backed) |
+
+### Pitch-sequence analyzer
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v2/sequences/pitcher/{id}` | one pitcher's 2-pitch combos, filterable by `season`, `balls`, `strikes`, `pitch1`, `pitch2`, `min_n`, `sort`, `limit` |
+| `GET /api/v2/sequences/batter/{id}` | one batter's outcomes on 2-pitch combos (no count slicing — the derived table rolls these up) |
+| `GET /api/v2/sequences/leaderboard?pitch1&pitch2&season&role&balls&strikes&min_n&limit` | top players on a specific sequence, ranked by lift vs league |
+
+### Matchup edges
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v2/matchup/pairing/{pitcher_id}/{batter_id}?season` | scouting card for one pair: top-3 edges + every (pitch, count) row sorted by leverage |
+| `GET /api/v2/matchup/edges/top?season&pitcher_id&batter_id&pitch_type&balls&strikes&min_pitcher_n&min_batter_swings&sort&limit` | general-purpose top-N over `matchup_edges` |
+
+### Batter names (Chadwick Bureau)
+
+The derived tables only store batter MLBAM IDs. On first startup the v2 API fetches Chadwick Bureau's public player register via `pybaseball.chadwick_register()` and caches a trimmed `(id, first, last)` lookup to `data/player_names.parquet` (~1 MB, 25K rows, ~4s to build). The file is gitignored and rebuilt automatically if deleted. If the fetch fails (no network on first launch) batter endpoints fall back to `id:665742`-style labels and keep working.
+
 ## Legacy web app
 
-The first-pitch offspeed CSW% / whiff% report lives at `reports/first_pitch_offspeed/` and is served by a FastAPI backend + React frontend. It runs against frozen per-division Parquet in `data/legacy/` and is unaffected by the new pipeline.
+The first-pitch offspeed CSW% / whiff% report lives at `reports/first_pitch_offspeed/` and is served by the same FastAPI app (legacy `/api/*` endpoints) + a React frontend. It runs against frozen per-division Parquet in `data/legacy/` and is unaffected by the new pipeline.
 
 ```bash
 # Backend (terminal 1)
@@ -316,6 +350,8 @@ npm run dev
 ```
 
 UI on http://localhost:5173, interactive API docs on http://localhost:8000/docs.
+
+To point the local frontend at the deployed VM API instead of a local uvicorn, create `frontend/.env.local` with `VITE_API_TARGET=http://<vm-ip>:8000` and restart `npm run dev`.
 
 ## Reports
 

@@ -184,6 +184,9 @@ cython_debug/
 data/raw/
 data/derived/
 
+# Chadwick Bureau player-name cache — auto-rebuilt by the v2 API on first run
+data/player_names.parquet
+
 # DuckDB
 *.duckdb
 *.duckdb.wal

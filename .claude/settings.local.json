@@ -31,7 +31,8 @@
       "Bash(.venv/Scripts/baseball rebuild-derived *)",
       "Bash(awk '{print $5, $9}')",
       "Bash(awk 'NR>2 {printf \"%-40s %10s bytes\\\\n\", $9, $5}')",
-      "Bash(.venv/Scripts/baseball daily-update *)"
+      "Bash(.venv/Scripts/baseball daily-update *)",
+      "Bash(.venv/Scripts/python.exe *)"
     ]
   }
 }
