@@ -380,6 +380,64 @@ sudo systemctl daemon-reload && sudo systemctl enable --now baseball-daily-updat
 
 See **[deploy/README.md](deploy/README.md)** for the full walkthrough, crontab alternative, troubleshooting, and environment-variable knobs (memory cap, log directory).
 
+### API service (FastAPI on the VM)
+
+The FastAPI app in `backend/main.py` runs as a long-lived systemd service. On boot it auto-starts, on crash it auto-restarts — you never manually run `uvicorn` on the VM.
+
+One-time install on the VM:
+
+```bash
+sudo tee /etc/systemd/system/mlb-api.service > /dev/null <<'EOF'
+[Unit]
+Description=MLB Pitch Analytics API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/baseball
+Environment=BASEBALL_LOG_LEVEL=INFO
+ExecStart=/opt/baseball/.venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now mlb-api.service
+```
+
+Open port 8000 to the public internet (**two layers** — both required on OCI):
+
+```bash
+# Host firewall: insert BEFORE the REJECT rule — check `sudo iptables -L INPUT --line-numbers` first
+sudo iptables -I INPUT 5 -p tcp --dport 8000 -j ACCEPT
+sudo apt install -y iptables-persistent
+sudo netfilter-persistent save
+```
+
+Then in the OCI console: **Networking → Virtual Cloud Networks →** your VCN **→ Security Lists →** Default **→ Add Ingress Rules** (source `0.0.0.0/0`, TCP, port 8000).
+
+**Daily ops** (after `git push` from laptop):
+
+```bash
+ssh ubuntu@<vm-ip>
+cd /opt/baseball
+git pull
+sudo systemctl restart mlb-api
+
+# Logs
+journalctl -u mlb-api -n 50 --no-pager      # recent output
+journalctl -u mlb-api -f                    # follow live
+sudo systemctl status mlb-api --no-pager    # is it running?
+```
+
+**Deferred:** TLS and CORS for production. Plain HTTP on port 8000 is fine for API exploration and backend development. Before exposing a public frontend, wire up Caddy for TLS and add the production origin to `CORSMiddleware` in `backend/main.py`.
+
 ## Project structure
 
 ```
